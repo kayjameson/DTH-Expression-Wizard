@@ -72,14 +72,31 @@ On the **Mixer** page:
 Face sequences are additive (local space, against the reference pose) and hold no bone motion, so in Sequencer you
 can put one on its own Animation track over a body animation; its weight curve scales the expression.
 
-## Scripting
+## Python scripting (optional)
 
-Every step is available to Python as `unreal.DTHExpressionScripting`: `open_wizard`, `measure_face_rig`,
-`build_library`, `list_expressions`, `mix_values`, `key_mix`, `set_mix`, `capture_preview`. Results are lists of lines; errors start with `ERROR:` and
-warnings with `WARNING:`.
+Everything the wizard's buttons do can also be run from Python in the Unreal editor, for example to rebuild the
+library or key many expressions into a sequence in one go. Run the code in the editor's Python console
+(**Window > Output Log**, set the input line to **Python**) or from your own editor scripts. The functions are on
+`unreal.DTHExpressionScripting`; empty paths use the ones on the wizard's Settings page.
 
-## What stays on your machine
+| Function | What it does |
+|---|---|
+| `build_library(samples_file, library_asset, strip_gaze, character)` | Builds the expression library, as **Build Library** does. |
+| `list_expressions(library_asset, filter)` | Lists the expressions, one line each, starting with the index the other functions use. |
+| `key_mix(sequence, skeletal_mesh, frame, expressions, strengths)` | Keys a mix of expressions (by index, with a strength each) at a frame, creating the sequence if needed. |
+| `mix_values(expressions, strengths)` | Shows the face-board values a mix comes to, without keying anything. |
+| `measure_face_rig(character, force)` | Measures DTH's face rig on a character (the build does this when it needs to). |
+| `open_wizard(page)`, `set_mix(skeletal_mesh, expressions, strengths)`, `capture_preview(file, view)` | Open the wizard on a page, set the Mixer's mix, save a picture of the preview. |
 
-The plugin and the Daz script are only the pipeline. Your expression samples, the measurement of DTH's face rig, the
-library and the sequences you key are made in your own project from your own content, and none of them belong in
-this repository (`.gitignore` keeps measurements and samples out).
+They return text: a list of lines (a single line for `open_wizard`, `set_mix` and `capture_preview`). Errors start with
+`ERROR:`, warnings with `WARNING:`.
+
+```python
+import unreal
+lib = unreal.DTHExpressionScripting
+for line in lib.list_expressions("", "Smile"):
+    print(line)                      # e.g. "12 | People/Genesis 9/Expressions/... | Smile 01 | 96% | 1.00 | 22 | 0"
+# Smile 01 at full strength on frame 0, back to neutral on frame 30:
+lib.key_mix("/Game/Faces/A_Smile", "/Game/Characters/MyCharacter/SKM_MyCharacter", 0, [12], [1.0])
+lib.key_mix("/Game/Faces/A_Smile", "", 30, [], [])
+```

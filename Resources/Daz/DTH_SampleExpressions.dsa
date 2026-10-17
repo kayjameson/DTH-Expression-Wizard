@@ -1,0 +1,318 @@
+// DTH Expression Wizard: Daz Studio sampler.
+//
+// Records, in Daz's own evaluation, what DTH's Genesis 9 face ROM and every expression preset in the user's content
+// library do to a base Genesis 9 face, and writes DTH_ExpressionSamples.json for the Unreal plugin. Nothing in the
+// scene or the content library is changed or saved; the scene is replaced by a fresh Genesis 9, so the script stops if
+// the current scene has unsaved changes.
+//
+// Expression presets are found the way Daz content is laid out: every pose preset in any folder named "Expressions"
+// under People/ in every content directory. Folders for another figure generation (People/Genesis 8 ...) are listed
+// and skipped: DTH's Genesis 9 face cannot play them.
+//
+// Run it from Daz Studio (File > Open, or double-click), or through a script server with `var args = {...}` defined
+// first. Without args it does every step with the defaults below.
+//   args.step     "all" (default) | "prepare" | "sample" | "rom" | "finish"
+//   args.out      output folder (default: Documents/DTH Expression Wizard)
+//   args.folders  extra content-library folders to sample as well (all subfolders), e.g. ["My Stuff/Faces"]
+//   args.first, args.count  ("sample") which presets of the prepared list to sample
+(function(){
+	var A = (typeof args !== "undefined" && args) ? args : {};
+	var STEP = A.step || "all";
+	var OUT = A.out || (App.getDocumentsPath() + "/DTH Expression Wizard");
+	var EXTRA_FOLDERS = A.folders || [];
+	var FIGURE_FILE = "People/Genesis 9/Genesis 9.duf";
+	// DazToHue's Genesis 9 ROM presets, loaded as the DTH guide does (body preset on the figure, mouth preset on its Mouth)
+	var ROM_DIR = "DazToHue/Poses/Genesis 9/DQS";
+	var ROM_BASE = "G9 DQS JCM FAC - Base.duf";
+	var ROM_MOUTH = "G9 DQS JCM FAC - Mouth.duf";
+	var CHANNELS = ["XRotate", "YRotate", "ZRotate", "XTranslate", "YTranslate", "ZTranslate"];
+	var result = {step: STEP, messages: []};
+
+	function note(s) { result.messages.push(s); print(s); }
+
+	function contentPath(rel) {
+		var mgr = App.getContentMgr();
+		for (var i = 0; i < mgr.getNumContentDirectories(); i++) {
+			var p = mgr.getContentDirectoryPath(i) + "/" + rel;
+			if (new DzFileInfo(p).exists()) return p;
+		}
+		return "";
+	}
+
+	function readText(path) { var f = new DzFile(path); if (!f.open(DzFile.ReadOnly)) return null; var t = f.read(); f.close(); return t; }
+	function writeText(path, text) { var f = new DzFile(path); if (!f.open(DzFile.WriteOnly | DzFile.Truncate)) return false; f.write(text); f.close(); return true; }
+
+	// The base figure and the figures fitted to it that carry face morphs (Genesis 9 Mouth, Eyes, Tear).
+	function figures() {
+		var out = [];
+		for (var i = 0; i < Scene.getNumSkeletons(); i++) {
+			var s = Scene.getSkeleton(i);
+			if (s.getName().indexOf("Genesis9") == 0) out.push(s);
+		}
+		return out;
+	}
+	function mainFigure() { var f = figures(); for (var i = 0; i < f.length; i++) if (f[i].getName() == "Genesis9") return f[i]; return null; }
+
+	function headBones(fig) {
+		var out = [], head = null, bones = fig.getAllBones();
+		for (var i = 0; i < bones.length; i++) if (bones[i].getName() == "head") head = bones[i];
+		if (!head) return bones;
+		for (var j = 0; j < bones.length; j++) {
+			var p = bones[j];
+			while (p && p != head) p = p.getNodeParent();
+			if (p == head) out.push(bones[j]);
+		}
+		return out;
+	}
+	function channel(b, c) {
+		if (c == "XRotate") return b.getXRotControl(); if (c == "YRotate") return b.getYRotControl();
+		if (c == "ZRotate") return b.getZRotControl(); if (c == "XTranslate") return b.getXPosControl();
+		if (c == "YTranslate") return b.getYPosControl(); return b.getZPosControl();
+	}
+
+	// Final (evaluated) value of every morph and head bone channel that is not zero.
+	function sample() {
+		var morphs = {}, bones = {}, figs = figures();
+		for (var i = 0; i < figs.length; i++) {
+			var f = figs[i], fn = f.getName(), obj = f.getObject();
+			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
+				var mod = obj.getModifier(m);
+				if (!mod || !mod.inherits("DzMorph")) continue;
+				var v = mod.getValueControl().getValue();
+				if (Math.abs(v) > 1e-6) morphs[fn + "|" + mod.getName()] = v;
+			}
+			var hb = headBones(f);
+			for (var k = 0; k < hb.length; k++)
+				for (var c = 0; c < CHANNELS.length; c++) {
+					var bv = channel(hb[k], CHANNELS[c]).getValue();
+					if (Math.abs(bv) > 1e-6) bones[fn + "|" + hb[k].getName() + "|" + CHANNELS[c]] = bv;
+				}
+		}
+		return {morphs: morphs, bones: bones};
+	}
+
+	// User values of every morph, head bone channel and figure pose control, to put the face back after a preset.
+	function snapshot() {
+		var snap = [], figs = figures();
+		for (var i = 0; i < figs.length; i++) {
+			var obj = figs[i].getObject();
+			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
+				var mod = obj.getModifier(m);
+				if (mod && mod.inherits("DzMorph")) snap.push([mod.getValueControl(), mod.getValueControl().getRawValue()]);
+			}
+			var hb = headBones(figs[i]);
+			for (var k = 0; k < hb.length; k++)
+				for (var c = 0; c < CHANNELS.length; c++) { var ch = channel(hb[k], CHANNELS[c]); snap.push([ch, ch.getRawValue()]); }
+			for (var n = 0; n < figs[i].getNumProperties(); n++) {
+				var np = figs[i].getProperty(n);
+				if (np && np.inherits("DzFloatProperty") && np.getPath().indexOf("/Pose Controls") == 0) snap.push([np, np.getRawValue()]);
+			}
+		}
+		return snap;
+	}
+	function restore(snap) { for (var i = 0; i < snap.length; i++) snap[i][0].setValue(snap[i][1]); }
+
+	function listPresets() {
+		var list = [], skipped = [], seen = {}, mgr = App.getContentMgr();
+		for (var i = 0; i < mgr.getNumContentDirectories(); i++) {
+			var root = mgr.getContentDirectoryPath(i);
+			if (new DzFileInfo(root + "/People").exists()) findExpressionFolders(root, "People", list, skipped, seen);
+			for (var e = 0; e < EXTRA_FOLDERS.length; e++)
+				if (new DzFileInfo(root + "/" + EXTRA_FOLDERS[e]).exists()) walk(root + "/" + EXTRA_FOLDERS[e], EXTRA_FOLDERS[e], list, skipped, seen);
+		}
+		return {presets: list, skipped: skipped};
+	}
+	// Every folder named "Expressions" below People/: sampled if it belongs to Genesis 9 (People/Genesis 9...), listed as
+	// skipped otherwise.
+	function findExpressionFolders(root, rel, list, skipped, seen) {
+		var dirs = new DzDir(root + "/" + rel).entryList(DzDir.Dirs | DzDir.NoDotAndDotDot, DzDir.Name);
+		for (var j = 0; j < dirs.length; j++) {
+			var sub = rel + "/" + dirs[j];
+			if (dirs[j].toLowerCase() == "expressions") {
+				var figure = sub.split("/")[1];
+				if (figure.indexOf("Genesis 9") == 0) walk(root + "/" + sub, sub, list, skipped, seen);
+				else skipped.push({file: sub, reason: "made for " + figure + ", not Genesis 9"});
+			}
+			else findExpressionFolders(root, sub, list, skipped, seen);
+		}
+	}
+	function walk(dirPath, rel, list, skipped, seen) {
+		var d = new DzDir(dirPath);
+		var files = d.entryList(["*.duf"], DzDir.Files, DzDir.Name);
+		for (var i = 0; i < files.length; i++) {
+			if (seen[rel + "/" + files[i]]) continue;
+			seen[rel + "/" + files[i]] = true;
+			// Plain-text files say what they are; compressed ones are tried when sampled (samplePresets checks them).
+			var text = readText(dirPath + "/" + files[i]) || "";
+			var type = text.charAt(0) == "{" ? /"type"\s*:\s*"([^"]+)"/.exec(text) : null;
+			if (type && type[1] != "preset_pose") { skipped.push({file: rel + "/" + files[i], reason: "not a pose preset (" + type[1] + ")"}); continue; }
+			var icon = "", stem = dirPath + "/" + files[i].replace(/\.duf$/, "");
+			var icons = [dirPath + "/" + files[i] + ".png", stem + ".png", stem + ".tip.png"];
+			for (var k = 0; k < icons.length && !icon; k++) if (new DzFileInfo(icons[k]).exists()) icon = icons[k];
+			list.push({pack: rel, label: files[i].replace(/\.duf$/, ""), file: dirPath + "/" + files[i], icon: icon});
+		}
+		var dirs = d.entryList(DzDir.Dirs | DzDir.NoDotAndDotDot, DzDir.Name);
+		for (var j = 0; j < dirs.length; j++) walk(dirPath + "/" + dirs[j], rel + "/" + dirs[j], list, skipped, seen);
+	}
+
+	function prepare() {
+		if (Scene.needsSave()) { result.error = "The open scene has unsaved changes. Save or close it, then run this again."; return false; }
+		Scene.clear();
+		var fig = contentPath(FIGURE_FILE);
+		if (!fig) { result.error = "Genesis 9 is not installed (" + FIGURE_FILE + ")."; return false; }
+		App.getContentMgr().openFile(fig, true);
+		if (!mainFigure()) { result.error = "Loading Genesis 9 did not give a Genesis9 figure."; return false; }
+		Scene.setTime(0);
+		var found = listPresets();
+		new DzDir(OUT).mkpath(OUT);
+		writeText(OUT + "/presets.json", JSON.stringify(found));
+		writeText(OUT + "/rest.json", JSON.stringify(sample()));
+		note("Genesis 9 loaded; " + found.presets.length + " expression presets found, " + found.skipped.length + " files or folders skipped.");
+		return true;
+	}
+
+	function samplePresets(first, count) {
+		var found = JSON.parse(readText(OUT + "/presets.json"));
+		var main = mainFigure(), out = [];
+		var last = Math.min(found.presets.length, first + count);
+		Scene.setTime(0);
+		// The face is put back to this after every preset, so one snapshot serves them all.
+		var snap = snapshot();
+		for (var i = first; i < last; i++) {
+			var p = found.presets[i];
+			var nodes = Scene.getNumNodes();
+			Scene.selectAllNodes(false); main.select(true); Scene.setPrimarySelection(main);
+			var ok = App.getContentMgr().openFile(p.file, true), why = ok ? "" : "Daz could not load it";
+			if (Scene.getNumNodes() != nodes) {
+				// it added something to the scene, so it is not a pose preset: take it out again
+				for (var n = Scene.getNumNodes() - 1; n >= nodes; n--) Scene.removeNode(Scene.getNode(n));
+				ok = false; why = "not a pose preset (it adds items to the scene)";
+			}
+			var s = ok ? sample() : null;
+			restore(snap);
+			out.push({pack: p.pack, label: p.label, file: p.file, icon: p.icon, loaded: ok, reason: why, state: s});
+		}
+		writeText(OUT + "/samples_" + first + ".json", JSON.stringify(out));
+		note("Sampled presets " + first + " to " + (last - 1) + " of " + found.presets.length + ".");
+		return last;
+	}
+
+	// Every key of a property: [frame, value].
+	function keys(prop) {
+		var out = [];
+		if (typeof prop.getNumKeys != "function") return out;
+		for (var k = 0; k < prop.getNumKeys(); k++)
+			out.push([Math.round(prop.getKeyTime(k) / Scene.getTimeStep()), prop.getKeyValue(k)]);
+		return out;
+	}
+
+	// The ROM's animated properties: morphs of the figure and its Mouth, and their head bone channels.
+	function animatedProperties(figs) {
+		var out = [];
+		for (var i = 0; i < figs.length; i++) {
+			var fn = figs[i].getName(), obj = figs[i].getObject();
+			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
+				var mod = obj.getModifier(m);
+				if (!mod || !mod.inherits("DzMorph")) continue;
+				var kk = keys(mod.getValueControl());
+				if (kk.length) out.push({name: fn + "|" + mod.getName(), keys: kk});
+			}
+			var hb = headBones(figs[i]);
+			for (var b = 0; b < hb.length; b++)
+				for (var c = 0; c < CHANNELS.length; c++) {
+					var kb = keys(channel(hb[b], CHANNELS[c]));
+					if (kb.length) out.push({name: fn + "|" + hb[b].getName() + "|" + CHANNELS[c], keys: kb});
+				}
+		}
+		return out;
+	}
+
+	// The frame a ROM frame was posed on top of: a property set at an earlier key to a value other than its frame-0 value
+	// and kept exactly at that value through this frame (re-keyed here at the same value, or its next key is the same
+	// value too). The base is where that value was first keyed; with several held values, the earliest (a pose posed on
+	// top of a base can keep a value from its neighbour as well). 0 when nothing is held.
+	function heldFrom(props, f) {
+		var base = 0;
+		for (var i = 0; i < props.length; i++) {
+			var kk = props[i].keys, from = -1;
+			for (var k = 0; k < kk.length && kk[k][0] < f; k++) from = k;
+			if (from < 0) continue;
+			var v = kk[from][1], rest = kk[0][0] == 0 ? kk[0][1] : 0;
+			if (Math.abs(v - rest) < 1e-6) continue;
+			// keys after 'from' are at or after this frame: the first one must keep the value (none: it stays)
+			if (from + 1 < kk.length && Math.abs(kk[from + 1][1] - v) > 1e-6) continue;
+			while (from > 0 && Math.abs(kk[from - 1][1] - v) < 1e-6) from--;
+			if (kk[from][0] > 0) base = base ? Math.min(base, kk[from][0]) : kk[from][0];
+		}
+		return base;
+	}
+
+	function sampleRom() {
+		var main = mainFigure(), mouth = null, figs = figures();
+		for (var i = 0; i < figs.length; i++) if (figs[i].getName() == "Genesis9Mouth") mouth = figs[i];
+		var base = contentPath(ROM_DIR + "/" + ROM_BASE), mouthRom = contentPath(ROM_DIR + "/" + ROM_MOUTH);
+		if (!base || !mouthRom || !mouth) { result.error = "DazToHue's Genesis 9 ROM presets (" + ROM_DIR + ") or the Genesis 9 Mouth are missing."; return false; }
+		var range = new DzTimeRange(0, 2000 * Scene.getTimeStep());
+		Scene.setAnimRange(range); Scene.setPlayRange(range);
+		Scene.setTime(0);
+		Scene.selectAllNodes(false); main.select(true); Scene.setPrimarySelection(main);
+		App.getContentMgr().openFile(base, true);
+		Scene.setTime(0);
+		Scene.selectAllNodes(false); mouth.select(true); Scene.setPrimarySelection(mouth);
+		App.getContentMgr().openFile(mouthRom, true);
+
+		var props = animatedProperties(figures()), last = 0;
+		for (var p = 0; p < props.length; p++)
+			for (var k = 0; k < props[p].keys.length; k++) last = Math.max(last, props[p].keys[k][0]);
+		var frames = {};
+		for (var fr = 0; fr <= last; fr++) {
+			Scene.setTime(fr * Scene.getTimeStep());
+			var s = sample(), keyed = [];
+			for (var q = 0; q < props.length; q++)
+				for (var kq = 0; kq < props[q].keys.length; kq++) if (props[q].keys[kq][0] == fr) { keyed.push(props[q].name); break; }
+			s.keyed = keyed;
+			s.base = heldFrom(props, fr);
+			frames["" + fr] = s;
+		}
+		Scene.setTime(0);
+		writeText(OUT + "/rom.json", JSON.stringify({basePreset: ROM_DIR + "/" + ROM_BASE, mouthPreset: ROM_DIR + "/" + ROM_MOUTH, frames: frames}));
+		note("Sampled DTH's ROM: frames 0 to " + last + ".");
+		return true;
+	}
+
+	function finish() {
+		var found = JSON.parse(readText(OUT + "/presets.json"));
+		var exprs = [];
+		for (var first = 0; first < found.presets.length; ) {
+			var t = readText(OUT + "/samples_" + first + ".json");
+			if (t === null) { result.error = "Presets from " + first + " were not sampled."; return false; }
+			var part = JSON.parse(t);
+			exprs = exprs.concat(part);
+			first += part.length;
+			if (!part.length) break;
+		}
+		var doc = {format: "DTH Expression Samples", version: 1, sampledAt: new Date().toISOString(),
+			dazVersion: App.longVersionString, figure: "Genesis 9", extraFolders: EXTRA_FOLDERS,
+			rest: JSON.parse(readText(OUT + "/rest.json")), rom: JSON.parse(readText(OUT + "/rom.json")),
+			expressions: exprs, skipped: found.skipped};
+		writeText(OUT + "/DTH_ExpressionSamples.json", JSON.stringify(doc));
+		result.file = OUT + "/DTH_ExpressionSamples.json";
+		note("Wrote " + result.file + " (" + exprs.length + " expressions).");
+		return true;
+	}
+
+	if (STEP == "prepare") prepare();
+	else if (STEP == "sample") result.next = samplePresets(A.first || 0, A.count || 25);
+	else if (STEP == "rom") sampleRom();
+	else if (STEP == "finish") finish();
+	else if (STEP == "all") {
+		if (prepare()) {
+			var total = JSON.parse(readText(OUT + "/presets.json")).presets.length;
+			for (var first = 0; first < total; ) first = samplePresets(first, 25);
+			if (sampleRom()) finish();
+		}
+		if (result.error) MessageBox.critical(result.error, "DTH Expression Wizard", "OK");
+		else MessageBox.information(result.messages.join("\n"), "DTH Expression Wizard", "OK");
+	}
+	return result;
+})();

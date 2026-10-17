@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "DTH Expression Wizard",
+	"Description": "Facial expressions for DazToHue Genesis 9 characters: builds an expression library from your Daz Studio expression packs and mixes and keys expressions into plain animation sequences that drive DTH's own face rig.",
+	"Category": "Animation",
+	"CreatedBy": "Kay",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "DTHExpressionWizard",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	]
+}

@@ -14,6 +14,7 @@
 #include "Misc/ScopedSlowTask.h"
 #include "Mixer/DTHCurveDriverInstance.h"
 #include "PreviewScene.h"
+#include "SkeletalRenderPublic.h"
 
 #define LOCTEXT_NAMESPACE "DTHFaceRigProbe"
 
@@ -63,6 +64,27 @@ namespace
 				float V = 0.0f;
 				Post->GetCurveValue(Read[I], V);
 				Out[I] = V;
+			}
+		}
+
+		/** Skinned positions (component space, cm) of these render vertices of LOD 0 for curves In, as Unreal skins them on the CPU. */
+		void Geometry(const TMap<FName, float>& In, const TArray<int32>& Vertices, TArray<FVector3f>& Out)
+		{
+			++Evaluations;
+			Driver->SetCurves(In);
+			// two ticks: a node that eases toward its input would not have arrived after one
+			for (int32 T = 0; T < 2; ++T)
+			{
+				Component->TickAnimation(1.0f / 30.0f, false);
+				Component->RefreshBoneTransforms();
+				Component->HandleExistingParallelEvaluationTask(true, true);
+			}
+			TArray<FFinalSkinVertex> Skinned;
+			Component->GetCPUSkinnedVertices(Skinned, 0);
+			Out.SetNumUninitialized(Vertices.Num());
+			for (int32 I = 0; I < Vertices.Num(); ++I)
+			{
+				Out[I] = Skinned.IsValidIndex(Vertices[I]) ? Skinned[Vertices[I]].Position : FVector3f::ZeroVector;
 			}
 		}
 
@@ -470,6 +492,36 @@ bool FDTHFaceRigProbe::DebugEvaluate(USkeletalMesh* Character, const TMap<FName,
 	}
 	Harness->Read = Read;
 	Harness->Eval(Curves, OutValues);
+	return true;
+}
+
+namespace
+{
+	TUniquePtr<FHarness>& GeometryHarness() { static TUniquePtr<FHarness> H; return H; }
+	TWeakObjectPtr<USkeletalMesh>& GeometryHarnessMesh() { static TWeakObjectPtr<USkeletalMesh> M; return M; }
+}
+
+bool FDTHFaceRigProbe::EvaluateGeometry(USkeletalMesh* Character, TConstArrayView<TMap<FName, float>> CurveSets, const TArray<int32>& Vertices,
+	TArray<FVector3f>& OutPositions, FString& OutError)
+{
+	TUniquePtr<FHarness>& Harness = GeometryHarness();
+	if (!Harness || GeometryHarnessMesh().Get() != Character)
+	{
+		Harness = MakeUnique<FHarness>();
+		GeometryHarnessMesh() = Character;
+		if (!Character || !Harness->Init(Character, OutError))
+		{
+			Harness.Reset();
+			return false;
+		}
+	}
+	OutPositions.Reset(CurveSets.Num() * Vertices.Num());
+	TArray<FVector3f> One;
+	for (const TMap<FName, float>& Set : CurveSets)
+	{
+		Harness->Geometry(Set, Vertices, One);
+		OutPositions.Append(One);
+	}
 	return true;
 }
 

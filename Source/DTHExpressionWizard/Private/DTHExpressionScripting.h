@@ -48,6 +48,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
 	static TArray<FString> DebugEvaluateFaceRig(const FString& Character, const TArray<FName>& Names, const TArray<float>& Values, const TArray<FName>& Read);
 
+	/**
+	 * Debug: plays each curve set of CurveSetsFile (JSON list of {curve: value}) on Character and writes the skinned
+	 * positions of the render vertices listed in VerticesFile (whitespace-separated LOD 0 indices) to OutFile:
+	 * int32 sets, int32 vertices, then float x, y, z per vertex per set.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
+	static TArray<FString> DebugEvaluateFaceGeometry(const FString& Character, const FString& CurveSetsFile, const FString& VerticesFile, const FString& OutFile);
+
+	/** Debug: Character's face board, one line per curve: curve | control | axis | sign | gain. */
+	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
+	static TArray<FString> DebugFaceBoardMap(const FString& Character);
+
 	/** One line per expression: index | pack | label | match % | max strength | curves | missing count. */
 	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
 	static TArray<FString> ListExpressions(const FString& LibraryAsset = TEXT(""), const FString& Filter = TEXT(""));
@@ -63,4 +75,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
 	static TArray<FString> KeyMix(const FString& SequencePath, const FString& SkeletalMesh, int32 Frame,
 		const TArray<int32>& Expressions, const TArray<float>& Strengths, const FString& LibraryAsset = TEXT(""));
+
+	/**
+	 * Keys a mix at Frame onto the control rig track of the binding BindingName in the level sequence at SequencePath,
+	 * for the character SkeletalMesh, as the Mixer's Key Expression button. Face controls, plus the curve corrections on
+	 * the binding's layered FK Control Rig track.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
+	static TArray<FString> KeyMixOntoControlRig(const FString& SequencePath, const FString& BindingName, const FString& SkeletalMesh, int32 Frame,
+		const TArray<int32>& Expressions, const TArray<float>& Strengths, bool bStepped = true, const FString& LibraryAsset = TEXT(""));
 };

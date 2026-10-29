@@ -5,6 +5,7 @@
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "DTHRigKeying.h"
 #include "Library/DTHExpressionLibrary.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
@@ -132,6 +133,32 @@ bool FDTHMixer::Key(UAnimSequence* Sequence, int32 Frame, const TMap<FName, floa
 	}
 	Controller.CloseBracket();
 	Sequence->MarkPackageDirty();
+	return true;
+}
+
+bool FDTHMixer::KeyOntoRig(const UDTHExpressionLibrary& Library, TConstArrayView<FDTHMixEntry> Entries, USkeletalMesh& Character,
+	ULevelSequence* Sequence, const FString& BindingName, int32 Frame, bool bStepped, TArray<FString>& OutLines)
+{
+	FString Error;
+	DTHRigKeying::FTarget Target;
+	if (!DTHRigKeying::Resolve(Sequence, BindingName, &Character, Target, Error))
+	{
+		OutLines.Add(TEXT("ERROR: ") + Error);
+		return false;
+	}
+	TMap<FName, float> Values;
+	Mix(Library, Entries, Values);
+	TMap<FName, FRigControlValue> Controls, Layer;
+	int32 Corrected = 0;
+	if (!DTHRigKeying::FaceBoard(Target.RigClass, Values, Controls, Layer, Corrected, Error)
+		|| !DTHRigKeying::Key(Target, Target.Track, Frame, Controls, {}, bStepped, Error)
+		|| !DTHRigKeying::Key(Target, Target.Layer, Frame, Layer, {}, bStepped, Error))
+	{
+		OutLines.Add(FString::Printf(TEXT("ERROR: frame %d: %s"), Frame, *Error));
+		return false;
+	}
+	OutLines.Add(FString::Printf(TEXT("Frame %d: keyed %d face controls of %s and %d curves on the FK layer; the layer corrects %d curves the board cannot show."),
+		Frame, Controls.Num(), *Target.RigClass->GetName(), Layer.Num(), Corrected));
 	return true;
 }
 

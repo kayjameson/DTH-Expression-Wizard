@@ -32,6 +32,11 @@ public class DTHExpressionWizard : ModuleRules
 			"ImageWrapper",
 			"ApplicationCore",
 			"RenderCore",
+			"DTHRigKeying",
+			"AnimationCore",
+			"ControlRig",
+			"RigVM",
+			"LevelSequence",
 		});
 	}
 }

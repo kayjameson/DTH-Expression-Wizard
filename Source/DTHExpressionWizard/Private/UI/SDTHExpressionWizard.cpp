@@ -16,6 +16,7 @@
 #include "Modules/ModuleManager.h"
 #include "PropertyCustomizationHelpers.h"
 #include "PropertyEditorModule.h"
+#include "SDTHRigKeyTarget.h"
 #include "Settings/DTHExpressionSettings.h"
 #include "Styling/AppStyle.h"
 #include "Styling/StyleColors.h"
@@ -410,7 +411,52 @@ TSharedRef<SWidget> SDTHExpressionWizard::MakeMixerPage()
 		+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 8.f, 0.f, 0.f)
 		[
 			MakeKeyBar()
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(0.f, 8.f, 0.f, 0.f)
+		[
+			MakeRigBar()
 		];
+}
+
+TSharedRef<SWidget> SDTHExpressionWizard::MakeRigBar()
+{
+	return MakeSection(LOCTEXT("RigSection", "Key onto a Control Rig (face controls only; body keys from the Pose Wizard stay)"),
+		SNew(SHorizontalBox)
+		+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+		[
+			SAssignNew(RigTarget, SDTHRigKeyTarget)
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8.f, 0.f, 0.f, 0.f)
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("KeyRig", "Key Expression"))
+			.ToolTipText(LOCTEXT("KeyRigTip", "Key the mix at the frame on the character's control rig track, then move to the next frame"))
+			.IsEnabled_Lambda([this]() { return Library.IsValid() && Preview.IsValid() && Preview->GetCharacter(); })
+			.OnClicked(this, &SDTHExpressionWizard::OnKeyRig)
+		]);
+}
+
+FReply SDTHExpressionWizard::OnKeyRig()
+{
+	const UDTHExpressionLibrary* Lib = Library.Get();
+	USkeletalMesh* Mesh = Preview.IsValid() ? Preview->GetCharacter() : nullptr;
+	if (!Lib || !Mesh || !RigTarget.IsValid())
+	{
+		return FReply::Handled();
+	}
+	TArray<FDTHMixEntry> Entries;
+	for (const TSharedPtr<FMixRow>& Row : MixRows)
+	{
+		if (!Row->bMuted) Entries.Add({Row->Expression, Row->Strength});
+	}
+	TArray<FString> Lines;
+	const int32 Frame = RigTarget->GetFrame();
+	if (FDTHMixer::KeyOntoRig(*Lib, Entries, *Mesh, RigTarget->GetSequence(), RigTarget->GetBinding(), Frame, RigTarget->IsStepped(), Lines))
+	{
+		RigTarget->SetFrame(Frame + 1);
+	}
+	Status = FString::Join(Lines, TEXT("  "));
+	return FReply::Handled();
 }
 
 TSharedRef<SWidget> SDTHExpressionWizard::MakeKeyBar()
@@ -450,7 +496,7 @@ TSharedRef<SWidget> SDTHExpressionWizard::MakeKeyBar()
 		[
 			SNew(SButton)
 			.Text(LOCTEXT("NewSequence", "Create"))
-			.ToolTipText(LOCTEXT("NewSequenceTip", "Create an empty face sequence for the character's skeleton in the Sequence Folder (Settings) and key into it"))
+			.ToolTipText(LOCTEXT("NewSequenceTip", "Create a face sequence for the character's skeleton in the Sequence Folder (Settings) with the current mix keyed at the frame"))
 			.IsEnabled_Lambda([this]() { return !NewSequenceName.IsEmpty() && Preview.IsValid() && Preview->GetCharacter(); })
 			.OnClicked(this, &SDTHExpressionWizard::OnNewSequence)
 		]
@@ -704,7 +750,10 @@ FReply SDTHExpressionWizard::OnNewSequence()
 	}
 	TargetSequence = Sequence;
 	NewSequenceName.Reset();
-	Status = FString::Printf(TEXT("Created %s."), *Sequence->GetPackage()->GetName());
+	// Created to be keyed into: the current mix goes in at the frame, so the sequence is never left empty.
+	const FString Created = Sequence->GetPackage()->GetName();
+	OnKey();
+	Status = FString::Printf(TEXT("Created %s and keyed the mix at frame %d."), *Created, KeyFrame);
 	return FReply::Handled();
 }
 
@@ -729,7 +778,8 @@ FReply SDTHExpressionWizard::OnKey()
 		Status = Error;
 		return FReply::Handled();
 	}
-	Status = FString::Printf(TEXT("Keyed the mix at frame %d of %s (not saved yet)."), KeyFrame, *TargetSequence->GetName());
+	SaveAsset(TargetSequence.Get());
+	Status = FString::Printf(TEXT("Keyed the mix at frame %d of %s and saved it."), KeyFrame, *TargetSequence->GetName());
 	return FReply::Handled();
 }
 

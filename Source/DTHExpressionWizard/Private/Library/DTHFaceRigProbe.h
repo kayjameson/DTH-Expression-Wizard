@@ -29,4 +29,11 @@ struct FDTHFaceRigProbe
 	 * of calls matters as it does during a measurement) and returns the values of Read after the post-process blueprint.
 	 */
 	static bool DebugEvaluate(USkeletalMesh* Character, const TMap<FName, float>& Curves, const TArray<FName>& Read, TArray<float>& OutValues, FString& OutError);
+
+	/**
+	 * Plays each curve set on the character through its post-process blueprint and returns the skinned positions of
+	 * Vertices (LOD 0 render vertices, component space, cm) for each set in turn, as Unreal skins them on the CPU.
+	 */
+	static bool EvaluateGeometry(USkeletalMesh* Character, TConstArrayView<TMap<FName, float>> CurveSets, const TArray<int32>& Vertices,
+		TArray<FVector3f>& OutPositions, FString& OutError);
 };

@@ -7,6 +7,7 @@
 class IDetailsView;
 class ITableRow;
 class SDTHFacePreview;
+class SDTHRigKeyTarget;
 class STableViewBase;
 class SWidgetSwitcher;
 class UAnimSequence;
@@ -54,6 +55,7 @@ private:
 	TSharedRef<SWidget> MakeBuildPage();
 	TSharedRef<SWidget> MakeMixerPage();
 	TSharedRef<SWidget> MakeKeyBar();
+	TSharedRef<SWidget> MakeRigBar();
 	TSharedRef<SWidget> MakeActionBar();
 	TSharedRef<ITableRow> MakeMessageRow(TSharedPtr<FMessage> Message, const TSharedRef<STableViewBase>& Owner);
 	TSharedRef<ITableRow> MakeExpressionRow(TSharedPtr<int32> Expression, const TSharedRef<STableViewBase>& Owner);
@@ -69,6 +71,8 @@ private:
 	FReply OnKey();
 	FReply OnSaveExpression();
 	FReply OnNewSequence();
+	/** Keys the mix at the chosen frame onto the character's control rig track. */
+	FReply OnKeyRig();
 	void AddMessage(FMessage::ESeverity Severity, const FString& Text);
 
 	FText GetStatusText() const;
@@ -93,6 +97,7 @@ private:
 	TSharedPtr<SListView<TSharedPtr<FMixRow>>> MixList;
 
 	TSharedPtr<SDTHFacePreview> Preview;
+	TSharedPtr<SDTHRigKeyTarget> RigTarget;
 	TWeakObjectPtr<UAnimSequence> TargetSequence;
 	FString NewSequenceName;
 	int32 KeyFrame = 0;

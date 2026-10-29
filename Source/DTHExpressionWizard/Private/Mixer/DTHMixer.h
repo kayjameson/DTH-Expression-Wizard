@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 
 class UAnimSequence;
+class ULevelSequence;
+class USkeletalMesh;
 class USkeleton;
 class UDTHExpressionLibrary;
 
@@ -32,6 +34,15 @@ struct FDTHMixer
 	 * is keyed, so the key fully sets the face; other keys are kept. Marks the sequence dirty (not saved).
 	 */
 	static bool Key(UAnimSequence* Sequence, int32 Frame, const TMap<FName, float>& Values, FString& OutError);
+
+	/**
+	 * Keys the mix at Frame onto the character's control rig track in Sequence (binding BindingName; the character's
+	 * default rig is added if it has none). The face board's controls carry what the board can show; the layered FK
+	 * Control Rig track adds the difference for every curve, so the face is exactly the Mixer's. Only face controls and
+	 * the layer's curves are keyed, so body keys from the Pose Wizard on the same frames stay.
+	 */
+	static bool KeyOntoRig(const UDTHExpressionLibrary& Library, TConstArrayView<FDTHMixEntry> Entries, USkeletalMesh& Character,
+		ULevelSequence* Sequence, const FString& BindingName, int32 Frame, bool bStepped, TArray<FString>& OutLines);
 
 	/** The face sequence's frame rate. */
 	static FFrameRate FrameRate() { return FFrameRate(30, 1); }

@@ -5,6 +5,9 @@
 // scene or the content library is changed or saved; the scene is replaced by a fresh Genesis 9, so the script stops if
 // the current scene has unsaved changes.
 //
+// For each preset it records the FACS state (morph values, head bone channels) and the face's shape: how far every vertex
+// of the head and of the Mouth figure moved from rest (face.json, geo_*.txt).
+//
 // Expression presets are found the way Daz content is laid out: every pose preset in any folder named "Expressions"
 // under People/ in every content directory. Folders for another figure generation (People/Genesis 8 ...) are listed
 // and skipped: DTH's Genesis 9 face cannot play them.
@@ -155,6 +158,84 @@
 		for (var j = 0; j < dirs.length; j++) walk(dirPath + "/" + dirs[j], rel + "/" + dirs[j], list, skipped, seen);
 	}
 
+	// The face whose shape the Unreal fit reproduces: the figure's head (every vertex above HEAD_DEPTH cm below the top of
+	// the head) and the whole Mouth figure (teeth, gums, tongue). The eyes are left out.
+	var FACE_FIGURES = ["Genesis9", "Genesis9Mouth"];
+	var HEAD_DEPTH = 26.0;
+	// Displacements are written as integers in this unit (cm): 1 micrometre.
+	var GEO_UNIT = 1e-4;
+
+	function figureByName(name) { var f = figures(); for (var i = 0; i < f.length; i++) if (f[i].getName() == name) return f[i]; return null; }
+
+	// Current (morphed and posed) positions of a figure's base mesh.
+	function positions(fig) {
+		var obj = fig.getObject();
+		obj.forceCacheUpdate(fig, false);
+		return obj.getCachedGeom();
+	}
+
+	// The face region of each face figure: its vertices, the facets made only of them (for subdividing exactly as the DTH
+	// export does) and their rest positions. Written once, in prepare.
+	var FACE = null;
+	function faceRegion() {
+		var out = [];
+		for (var f = 0; f < FACE_FIGURES.length; f++) {
+			var fig = figureByName(FACE_FIGURES[f]);
+			if (!fig) continue;
+			var geo = positions(fig), mesh = fig.getObject().getCurrentShape().getGeometry();
+			var n = geo.getNumVertices(), top = -1e9, keep = [], local = {};
+			for (var v = 0; v < n; v++) top = Math.max(top, geo.getVertex(v).y);
+			for (var v2 = 0; v2 < n; v2++) {
+				if (f > 0 || geo.getVertex(v2).y > top - HEAD_DEPTH) { local[v2] = keep.length; keep.push(v2); }
+			}
+			var facets = [];
+			for (var k = 0; k < mesh.getNumFacets(); k++) {
+				var fc = mesh.getFacet(k), ids = [fc.vertIdx1, fc.vertIdx2, fc.vertIdx3, fc.vertIdx4], ok = true, row = [];
+				for (var c = 0; c < 4; c++) {
+					if (ids[c] < 0) { row.push(-1); continue; }
+					if (local[ids[c]] === undefined) { ok = false; break; }
+					row.push(local[ids[c]]);
+				}
+				if (ok) facets.push(row);
+			}
+			var rest = [];
+			for (var r = 0; r < keep.length; r++) { var p = geo.getVertex(keep[r]); rest.push(p.x, p.y, p.z); }
+			out.push({name: FACE_FIGURES[f], vertices: keep, facets: facets, rest: rest});
+		}
+		return out;
+	}
+
+	// One line per face figure: "<preset index> <figure index> <count> (<vertex> <dx> <dy> <dz>)*" in GEO_UNIT integers,
+	// for the face vertices that moved from rest.
+	function faceGeometryLines(index) {
+		var lines = [];
+		for (var f = 0; f < FACE.length; f++) {
+			var fig = figureByName(FACE[f].name), geo = positions(fig), parts = [], count = 0, R = FACE[f].rest;
+			for (var i = 0; i < FACE[f].vertices.length; i++) {
+				var p = geo.getVertex(FACE[f].vertices[i]);
+				var dx = Math.round((p.x - R[3 * i]) / GEO_UNIT), dy = Math.round((p.y - R[3 * i + 1]) / GEO_UNIT), dz = Math.round((p.z - R[3 * i + 2]) / GEO_UNIT);
+				if (dx || dy || dz) { parts.push(i, dx, dy, dz); ++count; }
+			}
+			lines.push(index + " " + f + " " + count + (count ? " " + parts.join(" ") : ""));
+		}
+		return lines;
+	}
+
+	// Morphs the preset turned on that are not Genesis 9 FACS shapes but carry vertex deltas of their own (a pack's
+	// sculpted shape): DTH's face can only approximate those.
+	function sculptedMorphs() {
+		var out = [], main = mainFigure(), obj = main.getObject();
+		for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
+			var mod = obj.getModifier(m);
+			if (!mod || !mod.inherits("DzMorph") || Math.abs(mod.getValueControl().getValue()) < 1e-4) continue;
+			var name = mod.getName();
+			if (name.indexOf("facs_") == 0 || name.indexOf("_HD") >= 0 || name.indexOf("body_bs_") == 0) continue;
+			var deltas = mod.getDeltas();
+			if (deltas && deltas.getNumDeltas() > 0) out.push(name);
+		}
+		return out;
+	}
+
 	function prepare() {
 		if (Scene.needsSave()) { result.error = "The open scene has unsaved changes. Save or close it, then run this again."; return false; }
 		Scene.clear();
@@ -167,6 +248,7 @@
 		new DzDir(OUT).mkpath(OUT);
 		writeText(OUT + "/presets.json", JSON.stringify(found));
 		writeText(OUT + "/rest.json", JSON.stringify(sample()));
+		writeText(OUT + "/face.json", JSON.stringify({unit: GEO_UNIT, figures: faceRegion()}));
 		note("Genesis 9 loaded; " + found.presets.length + " expression presets found, " + found.skipped.length + " files or folders skipped.");
 		return true;
 	}
@@ -178,6 +260,8 @@
 		Scene.setTime(0);
 		// The face is put back to this after every preset, so one snapshot serves them all.
 		var snap = snapshot();
+		FACE = JSON.parse(readText(OUT + "/face.json")).figures;
+		var geoLines = [];
 		for (var i = first; i < last; i++) {
 			var p = found.presets[i];
 			var nodes = Scene.getNumNodes();
@@ -189,10 +273,12 @@
 				ok = false; why = "not a pose preset (it adds items to the scene)";
 			}
 			var s = ok ? sample() : null;
+			if (ok) { geoLines = geoLines.concat(faceGeometryLines(i)); s.sculpted = sculptedMorphs(); }
 			restore(snap);
 			out.push({pack: p.pack, label: p.label, file: p.file, icon: p.icon, loaded: ok, reason: why, state: s});
 		}
 		writeText(OUT + "/samples_" + first + ".json", JSON.stringify(out));
+		writeText(OUT + "/geo_" + first + ".txt", geoLines.join("\n"));
 		note("Sampled presets " + first + " to " + (last - 1) + " of " + found.presets.length + ".");
 		return last;
 	}
@@ -282,18 +368,23 @@
 
 	function finish() {
 		var found = JSON.parse(readText(OUT + "/presets.json"));
-		var exprs = [];
+		var exprs = [], geometryFiles = [];
 		for (var first = 0; first < found.presets.length; ) {
 			var t = readText(OUT + "/samples_" + first + ".json");
 			if (t === null) { result.error = "Presets from " + first + " were not sampled."; return false; }
+			if (!new DzFileInfo(OUT + "/geo_" + first + ".txt").exists()) { result.error = "Presets from " + first + " have no face geometry: sample them again with this script."; return false; }
+			geometryFiles.push("geo_" + first + ".txt");
 			var part = JSON.parse(t);
 			exprs = exprs.concat(part);
 			first += part.length;
 			if (!part.length) break;
 		}
-		var doc = {format: "DTH Expression Samples", version: 1, sampledAt: new Date().toISOString(),
+		// Version 2 adds the face shape: the face region (face.json) and each preset's face displacement (geometryFiles,
+		// next to this file), which the Unreal fit reproduces.
+		var doc = {format: "DTH Expression Samples", version: 2, sampledAt: new Date().toISOString(),
 			dazVersion: App.longVersionString, figure: "Genesis 9", extraFolders: EXTRA_FOLDERS,
 			rest: JSON.parse(readText(OUT + "/rest.json")), rom: JSON.parse(readText(OUT + "/rom.json")),
+			face: JSON.parse(readText(OUT + "/face.json")), geometryFiles: geometryFiles,
 			expressions: exprs, skipped: found.skipped};
 		writeText(OUT + "/DTH_ExpressionSamples.json", JSON.stringify(doc));
 		result.file = OUT + "/DTH_ExpressionSamples.json";

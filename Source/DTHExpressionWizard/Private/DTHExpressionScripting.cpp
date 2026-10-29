@@ -2,14 +2,20 @@
 
 #include "Animation/AnimSequence.h"
 #include "Engine/SkeletalMesh.h"
+#include "LevelSequence.h"
 #include "Framework/Docking/TabManager.h"
 #include "DTHExpressionWizardModule.h"
+#include "DTHRigKeying.h"
 #include "Library/DTHExpressionLibrary.h"
 #include "Library/DTHFaceRig.h"
 #include "Library/DTHFaceRigProbe.h"
 #include "Library/DTHLibraryBuild.h"
+#include "Dom/JsonObject.h"
+#include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Mixer/DTHMixer.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Settings/DTHExpressionSettings.h"
 #include "UI/SDTHExpressionWizard.h"
 #include "UObject/Package.h"
@@ -139,6 +145,67 @@ TArray<FString> UDTHExpressionScripting::DebugEvaluateFaceRig(const FString& Cha
 	return Lines;
 }
 
+TArray<FString> UDTHExpressionScripting::DebugEvaluateFaceGeometry(const FString& Character, const FString& CurveSetsFile, const FString& VerticesFile, const FString& OutFile)
+{
+	TArray<FString> Lines;
+	USkeletalMesh* Mesh = Cast<USkeletalMesh>(FSoftObjectPath(Character).TryLoad());
+	FString Text, VertText;
+	TSharedPtr<FJsonValue> Root;
+	if (!Mesh || !FFileHelper::LoadFileToString(Text, *CurveSetsFile) || !FFileHelper::LoadFileToString(VertText, *VerticesFile)
+		|| !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Root) || !Root.IsValid())
+	{
+		Lines.Add(TEXT("ERROR: could not read the character, the curve sets (JSON list of {curve: value}) or the vertex list."));
+		return Lines;
+	}
+	TArray<TMap<FName, float>> Sets;
+	for (const TSharedPtr<FJsonValue>& V : Root->AsArray())
+	{
+		TMap<FName, float>& Set = Sets.AddDefaulted_GetRef();
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& C : V->AsObject()->Values) Set.Add(FName(*C.Key), static_cast<float>(C.Value->AsNumber()));
+	}
+	TArray<int32> Vertices;
+	TArray<FString> Parts;
+	VertText.ParseIntoArrayWS(Parts);
+	for (const FString& P : Parts) Vertices.Add(FCString::Atoi(*P));
+	TArray<FVector3f> Positions;
+	FString Error;
+	const double Start = FPlatformTime::Seconds();
+	if (!FDTHFaceRigProbe::EvaluateGeometry(Mesh, Sets, Vertices, Positions, Error))
+	{
+		Lines.Add(TEXT("ERROR: ") + Error);
+		return Lines;
+	}
+	const double Seconds = FPlatformTime::Seconds() - Start;
+	TArray<uint8> Bytes;
+	const int32 Header[2] = {Sets.Num(), Vertices.Num()};
+	Bytes.Append(reinterpret_cast<const uint8*>(Header), sizeof(Header));
+	Bytes.Append(reinterpret_cast<const uint8*>(Positions.GetData()), Positions.Num() * sizeof(FVector3f));
+	if (!FFileHelper::SaveArrayToFile(Bytes, *OutFile))
+	{
+		Lines.Add(TEXT("ERROR: could not write ") + OutFile);
+		return Lines;
+	}
+	Lines.Add(FString::Printf(TEXT("%d sets x %d vertices in %.2f s"), Sets.Num(), Vertices.Num(), Seconds));
+	return Lines;
+}
+
+TArray<FString> UDTHExpressionScripting::DebugFaceBoardMap(const FString& Character)
+{
+	TArray<FString> Lines;
+	const USkeletalMesh* Mesh = Cast<USkeletalMesh>(FSoftObjectPath(Character).TryLoad());
+	UClass* Rig = Mesh ? DTHRigKeying::DefaultRig(Mesh) : nullptr;
+	if (!Rig)
+	{
+		Lines.Add(TEXT("ERROR: no character or no default animating rig: ") + Character);
+		return Lines;
+	}
+	for (const DTHRigKeying::FBoardSlot& S : DTHRigKeying::BoardMap(Rig))
+	{
+		Lines.Add(FString::Printf(TEXT("%s|%s|%d|%g|%g"), *S.Curve.ToString(), *S.Control.ToString(), S.Axis, S.Sign, S.Gain));
+	}
+	return Lines;
+}
+
 TArray<FString> UDTHExpressionScripting::ListExpressions(const FString& LibraryAsset, const FString& Filter)
 {
 	TArray<FString> Lines;
@@ -213,5 +280,21 @@ TArray<FString> UDTHExpressionScripting::KeyMix(const FString& SequencePath, con
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	UPackage::SavePackage(Package, Sequence, *FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension()), SaveArgs);
 	Lines.Add(FString::Printf(TEXT("Keyed %d curves at frame %d of %s."), Values.Num(), Frame, *PackageName));
+	return Lines;
+}
+
+TArray<FString> UDTHExpressionScripting::KeyMixOntoControlRig(const FString& SequencePath, const FString& BindingName, const FString& SkeletalMesh, int32 Frame,
+	const TArray<int32>& Expressions, const TArray<float>& Strengths, bool bStepped, const FString& LibraryAsset)
+{
+	TArray<FString> Lines;
+	const UDTHExpressionLibrary* Library = LoadLibrary(LibraryAsset, Lines);
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, *SkeletalMesh, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	ULevelSequence* Sequence = LoadObject<ULevelSequence>(nullptr, *SequencePath, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	if (!Library || !Mesh || !Sequence)
+	{
+		if (Library) Lines.Add(!Mesh ? FString::Printf(TEXT("ERROR: No skeletal mesh at %s."), *SkeletalMesh) : FString::Printf(TEXT("ERROR: No level sequence at %s."), *SequencePath));
+		return Lines;
+	}
+	FDTHMixer::KeyOntoRig(*Library, Entries(Expressions, Strengths), *Mesh, Sequence, BindingName, Frame, bStepped, Lines);
 	return Lines;
 }

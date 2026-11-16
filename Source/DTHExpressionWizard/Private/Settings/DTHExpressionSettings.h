@@ -26,9 +26,9 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Library", meta = (DisplayName = "Expression Library"))
 	FString LibraryAsset;
 
-	/** Leave the eye direction to the animator: expressions do not turn the eyes (lids still follow the expression). */
+	/** On: leave the eye direction to the animator, expressions do not turn the eyes (lids still follow the expression). Off (default): each expression turns the eyes as its Daz preset does. */
 	UPROPERTY(config, EditAnywhere, Category = "Library", meta = (DisplayName = "Strip Gaze"))
-	bool bStripGaze = true;
+	bool bStripGaze = false;
 
 	/** New keyed sequences are created in this folder. */
 	UPROPERTY(config, EditAnywhere, Category = "Mixer", meta = (ContentDir, DisplayName = "Sequence Folder"))

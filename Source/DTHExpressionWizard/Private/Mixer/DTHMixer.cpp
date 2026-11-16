@@ -6,6 +6,7 @@
 #include "Animation/Skeleton.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "DTHRigKeying.h"
+#include "DTHFaceBones.h"
 #include "Library/DTHExpressionLibrary.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
@@ -34,7 +35,8 @@ void FDTHMixer::Mix(const UDTHExpressionLibrary& Library, TConstArrayView<FDTHMi
 	}
 	for (TPair<FName, float>& V : OutValues)
 	{
-		V.Value = FMath::Clamp(V.Value, 0.0f, 1.0f);
+		// face-board curves have the board's 0..1 range; DTH's morph curves (fac*) carry what is past it, and have none
+		if (IsBoardCurve(V.Key)) V.Value = FMath::Clamp(V.Value, 0.0f, 1.0f);
 	}
 }
 
@@ -120,7 +122,27 @@ bool FDTHMixer::Key(UAnimSequence* Sequence, int32 Frame, const TMap<FName, floa
 		SetRootKeys(Sequence, true);
 	}
 	const float Time = static_cast<float>(Model->GetFrameRate().AsSeconds(FFrameNumber(Frame)));
-	for (const TPair<FName, float>& V : Values)
+	TMap<FName, float> Curves;
+	TMap<FName, FQuat> Turns;
+	DTHFaceBones::Split(Values, Curves, Turns);
+	// Face bones past DTH's face rig: bone tracks (the sequence is additive against the reference pose, so a track is the
+	// reference pose turned), keyed at this frame; the track's other frames keep their keys, a new track starts at rest.
+	const FReferenceSkeleton& Ref = Sequence->GetSkeleton()->GetReferenceSkeleton();
+	const int32 Keys = Model->GetNumberOfKeys();
+	for (const TPair<FName, FTransform>& B : DTHFaceBones::Local(Ref, Turns))
+	{
+		TArray<FTransform> Track;
+		if (Model->IsValidBoneTrackName(B.Key)) Model->GetBoneTrackTransforms(B.Key, Track);
+		else Controller.AddBoneCurve(B.Key);
+		const FTransform& RefPose = Ref.GetRefBonePose()[Ref.FindBoneIndex(B.Key)];
+		while (Track.Num() < Keys) Track.Add(RefPose);
+		Track.SetNum(Keys);
+		if (Track.IsValidIndex(Frame)) Track[Frame] = B.Value;
+		TArray<FVector> Positions; TArray<FQuat> Rotations; TArray<FVector> Scales;
+		for (const FTransform& T : Track) { Positions.Add(T.GetTranslation()); Rotations.Add(T.GetRotation()); Scales.Add(T.GetScale3D()); }
+		Controller.SetBoneTrackKeys(B.Key, Positions, Rotations, Scales);
+	}
+	for (const TPair<FName, float>& V : Curves)
 	{
 		const FAnimationCurveIdentifier Id(V.Key, ERawCurveTrackTypes::RCT_Float);
 		if (!Model->FindFloatCurve(Id))
@@ -146,19 +168,23 @@ bool FDTHMixer::KeyOntoRig(const UDTHExpressionLibrary& Library, TConstArrayView
 		OutLines.Add(TEXT("ERROR: ") + Error);
 		return false;
 	}
-	TMap<FName, float> Values;
+	TMap<FName, float> Values, Curves;
 	Mix(Library, Entries, Values);
+	TMap<FName, FQuat> Turns;
+	DTHFaceBones::Split(Values, Curves, Turns);
+	// face bones past DTH's face rig go on the FK layer as the bones' local transforms
+	const TMap<FName, FTransform> Bones = DTHFaceBones::Local(Character.GetRefSkeleton(), Turns);
 	TMap<FName, FRigControlValue> Controls, Layer;
 	int32 Corrected = 0;
-	if (!DTHRigKeying::FaceBoard(Target.RigClass, Values, Controls, Layer, Corrected, Error)
+	if (!DTHRigKeying::FaceBoard(Target.RigClass, Curves, Controls, Layer, Corrected, Error)
 		|| !DTHRigKeying::Key(Target, Target.Track, Frame, Controls, {}, bStepped, Error)
-		|| !DTHRigKeying::Key(Target, Target.Layer, Frame, Layer, {}, bStepped, Error))
+		|| !DTHRigKeying::Key(Target, Target.Layer, Frame, Layer, Bones, bStepped, Error))
 	{
 		OutLines.Add(FString::Printf(TEXT("ERROR: frame %d: %s"), Frame, *Error));
 		return false;
 	}
-	OutLines.Add(FString::Printf(TEXT("Frame %d: keyed %d face controls of %s and %d curves on the FK layer; the layer corrects %d curves the board cannot show."),
-		Frame, Controls.Num(), *Target.RigClass->GetName(), Layer.Num(), Corrected));
+	OutLines.Add(FString::Printf(TEXT("Frame %d: keyed %d face controls of %s, and %d curves and %d face bones on the FK layer; the layer corrects %d curves the board cannot show."),
+		Frame, Controls.Num(), *Target.RigClass->GetName(), Layer.Num(), Bones.Num(), Corrected));
 	return true;
 }
 

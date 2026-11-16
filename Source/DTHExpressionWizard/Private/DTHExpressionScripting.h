@@ -34,7 +34,7 @@ public:
 	 * Character (a skeletal mesh path) first if needed.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "DTH Expression Wizard")
-	static TArray<FString> BuildLibrary(const FString& SamplesFile = TEXT(""), const FString& LibraryAsset = TEXT(""), bool bStripGaze = true,
+	static TArray<FString> BuildLibrary(const FString& SamplesFile = TEXT(""), const FString& LibraryAsset = TEXT(""), bool bStripGaze = false,
 		const FString& Character = TEXT(""));
 
 	/**

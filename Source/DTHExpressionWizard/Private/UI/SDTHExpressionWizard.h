@@ -83,6 +83,8 @@ private:
 	TSharedPtr<IDetailsView> SettingsView;
 
 	TWeakObjectPtr<UDTHExpressionLibrary> Library;
+	/** The library's expressions with shapes DTH's face cannot make, counted once when it is loaded. */
+	int32 NumPartial = 0;
 	FString Status;
 
 	TArray<TSharedPtr<FMessage>> Messages;
@@ -91,7 +93,9 @@ private:
 	FString Search;
 	TArray<TSharedPtr<int32>> ExpressionRows;
 	TSharedPtr<SListView<TSharedPtr<int32>>> ExpressionList;
-	TMap<int32, TSharedPtr<FSlateDynamicImageBrush>> Icons;
+	/** Preset icons of the rows on screen lately (the frame each was last drawn): the ones out of sight are let go. */
+	struct FIcon { TSharedPtr<FSlateDynamicImageBrush> Brush; uint64 Frame = 0; };
+	TMap<int32, FIcon> Icons;
 
 	TArray<TSharedPtr<FMixRow>> MixRows;
 	TSharedPtr<SListView<TSharedPtr<FMixRow>>> MixList;

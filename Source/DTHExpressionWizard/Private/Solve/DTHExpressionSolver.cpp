@@ -1,7 +1,7 @@
 #include "Solve/DTHExpressionSolver.h"
 
 #include "Library/DTHExpressionSamples.h"
-#include "Library/DTHFaceRig.h"
+#include "DTHFaceRig.h"
 
 namespace
 {

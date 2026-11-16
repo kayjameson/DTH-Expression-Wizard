@@ -16,8 +16,8 @@ one library works for every DTH Genesis 9 character on the same skeleton.
   the character's copy of DTH's post-process blueprint, and the face-board curves registered on the mesh.
 - Daz Studio with Genesis 9, the DazToHue Daz content (its ROM presets, `DazToHue/Poses/Genesis 9/DQS`), and the
   expression packs you want in the library.
-- The DTH Pose Wizard plugin (0.2.0 or later): the Expression Wizard keys control rigs and reads the face board
-  through its control-rig keying module.
+- The DTH Pose Wizard plugin (0.4.0 or later): the Expression Wizard keys control rigs and reads the face board
+  through its control-rig keying module, and fits faces with its shared face module (`DTHFaceCore`).
 
 ## Install
 
@@ -50,21 +50,30 @@ pairs, through the character's own DTH post-process blueprint off screen and rec
 minutes). The measurement is kept in your project's `Saved/DTHExpressionWizard` folder and reused until DTH's
 content changes. Nothing about DTH's rig ships with the plugin.
 
-Each expression is fitted by its **shape**: the plugin finds the face-board values that make the character's face, as
-DTH's face rig and its dual-quaternion deformer show it, as close as possible to the Daz expression's face, vertex by
-vertex (the whole face, teeth and tongue included, the eyeballs left out). Any combination of board curves can be
-used, within what a face-board key can hold: only face-board curves, each slider at one end at a time. Every step of
-the fit is measured on the character's real rig, and a fit takes at most 2 seconds.
+Each expression is fitted by its **shape**: the plugin finds the values that make the character's face, as DTH's face
+rig and its dual-quaternion deformer show it, as close as possible to the Daz expression's face, vertex by vertex (the
+whole face, teeth, tongue and eyeballs included). Every step of the fit is measured on the character's
+real rig, and a fit takes about 3 seconds. It uses, in this order:
+
+- the **face board's curves** (`CTRL_expressions_*`), each slider at one end at a time, 0 to 1;
+- **DTH's own morph curves** (`fac*`, one per face pose) where Daz pushes a shape past what the board's full value
+  makes, or the board cannot reach a pose: DTH's face rig clamps every pose weight to 0..1, and its post-process adds
+  these curves on top of what the rig writes (measured: `DTH.ExpressionWizard.CurveReach`);
+- **face bones** (jaw, tongue) turned past what the rig's bone poses reach: a face sequence's own bone tracks pass
+  through DTH's post-process, with the rig's poses added on top (`DTH.Pose.Face.BoneTracks`).
+
+The morph curves and bones cost a little in the fit, so the board does what it can first. Nothing of DTH's is changed.
 
 Build on a plain Genesis 9 exported through DazToHue (for example `G9_Base`): it is the figure the expressions were
 sampled on, so the face is compared point for point. The values then play on every DTH Genesis 9 character, as a Daz
 expression does on any Genesis 9 character.
 
 Each expression gets a **match percentage**: how much of the Daz face's movement the character's face reproduces
-(100% = identical). On the 42 test expressions, 26 reach 94% or more. What keeps the others lower is DTH's own face
-poses: its brow poses reproduce Daz's brows at 87 to 90%, its tongue-tip poses move the tip about two thirds as far,
-and some packs push brows past their full value or below zero. The report also lists anything DTH's face cannot make
-and why:
+(100% = identical). Measured on G9_Base (2026-11-16, the 42 test expressions): 40 reach 94% or more (26 with the board
+alone); most face regions are within 0.4 mm of Daz, brows at worst 2.3 mm where Daz moves them 16 mm (Emotional
+Angry), the tongue tip within 3-4 mm in tongue-out faces. The two below 94% move the face less than 3 mm and are within
+0.3 mm in every region. Side-by-side Daz and Unreal shots: `docs/evidence/face-fit-2026-11-16` in the outer repo. The
+report also lists anything DTH's face cannot make and why:
 
 - *no pose in DTH's face ROM makes this shape*: Daz shapes DTH's ROM does not capture;
 - *only DTH poses the face rig does not drive make this shape*: some of DTH's face poses are not reachable from the
@@ -73,11 +82,13 @@ and why:
   (for example HS Icey); DTH's face poses can only approximate it.
 
 Presets that leave the face neutral (resets) are skipped. Each expression also gets a maximum strength (how far it
-can be overdriven before a curve leaves its range). **Strip Gaze** (Settings, on by default) leaves eye direction to
-you: expressions do not turn the eyes.
+can be overdriven before a curve leaves its range). **Strip Gaze** (Settings, off by default) leaves eye direction to
+you when on: expressions do not turn the eyes. Off, each expression turns the eyes as its Daz preset does, past DTH's
+20 deg eye-look limit where the preset goes further.
 
 Samples from an older version of the Daz script (without the face shape) still build, with the older fit by FACS
-values; sample again to get the shape fit.
+values; sample again to get the shape fit. Samples taken before 2026-11-16 have no eyeballs: the gaze is then not
+measured (the eyes only follow the lids), so sample again to get each expression's eye direction.
 
 ## 3. Mix and key
 
@@ -88,12 +99,18 @@ On the **Mixer** page:
 - the preview shows the mix live, through your character's own DTH setup;
 - pick a **Sequence** on the character's skeleton, or type a name and press **Create** (made in the Sequence Folder,
   with the current mix keyed at the frame);
-- set the **Frame** and press **Key**. Every face-board curve is keyed, so a key fully sets the face at that frame;
-  other keys are kept, and the sequence is saved;
+- set the **Frame** and press **Key**. Every curve the library uses is keyed (face-board and morph curves), and the
+  face bones an expression turns (jaw, tongue), so a key fully sets the face at that frame; other keys are kept, and
+  the sequence is saved;
 - **Save Mix as Sequence** writes the current mix as its own short sequence.
 
-Face sequences are additive (local space, against the reference pose) and hold no bone motion, so in Sequencer you
-can put one on its own Animation track over a body animation; its weight curve scales the expression.
+Face sequences are additive (local space, against the reference pose) and move no body bone (only the jaw and tongue
+when an expression turns them), so in Sequencer you can put one on its own Animation track over a body animation; its
+weight curve scales the expression.
+
+On a control rig (below), the face board keys what the board shows; the morph curves and face bones go on the layered
+FK track. They are not on the face board itself: making them available on the DTH Control Boards panel is a separate
+to-do.
 
 ## Key onto a Control Rig
 

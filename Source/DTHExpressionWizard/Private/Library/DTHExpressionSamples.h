@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "DTHFaceRegion.h"
 
 /** One sampled Daz state: final morph values ("Figure|morph") and head bone channels ("Figure|bone|XRotate"). */
 struct FDTHDazState
@@ -29,17 +30,14 @@ struct FDTHDazExpression
 	FDTHDazState State;
 };
 
-/** A figure's part of the face the fit reproduces: its vertices (indices into the figure's base mesh), the facets made of
- * them (indices into Vertices; the 4th is -1 for a triangle) and their rest positions (Daz space, cm). */
-struct FDTHFaceFigure
-{
-	FString Name;
-	TArray<int32> Vertices;
-	TArray<FIntVector4> Facets;
-	TArray<FVector3f> Rest;
-};
 
-/** DTH_ExpressionSamples.json, written by Resources/Daz/DTH_SampleExpressions.dsa. */
+/**
+ * DTH_ExpressionSamples.json, written by Resources/Daz/DTH_SampleExpressions.dsa.
+ *
+ * A library can hold hundreds of thousands of expressions, so Load reads only the manifest, the rest state, the ROM and
+ * the face region; ReadExpressions streams the expressions one samples file at a time (version 3 writes them 100 to a
+ * file). Version 2 files (every expression in the manifest) are read too.
+ */
 struct FDTHExpressionSamples
 {
 	FString SampledAt;
@@ -47,14 +45,27 @@ struct FDTHExpressionSamples
 	FDTHDazState Rest;
 	/** DTH's face ROM: frame -> state (frame 0 and the Fac frames). */
 	TMap<int32, FDTHDazState> RomFrames;
-	TArray<FDTHDazExpression> Expressions;
+	/** How many expressions ReadExpressions gives. */
+	int32 NumExpressions = 0;
 
-	/** The face region (samples version 2): the Genesis 9 head and the Mouth figure. Empty for older samples. */
+	/** The face region (samples version 2 and later): the Genesis 9 head and the Mouth figure. Empty for older samples. */
 	TArray<FDTHFaceFigure> Face;
-	/** Per expression, per face figure: how far each region vertex moved from rest (Daz space, cm). Empty when not sampled. */
-	TArray<TArray<TArray<FVector3f>>> FaceDisplacement;
 
 	bool HasFace() const { return !Face.IsEmpty(); }
 
 	bool Load(const FString& File, FString& OutError);
+
+	/**
+	 * Calls Visit for every expression in order, with its face displacement: per face figure, how far each region vertex
+	 * moved from rest (Daz space, cm; empty when the samples have no face shape). Visit returns false to stop.
+	 */
+	bool ReadExpressions(TFunctionRef<bool(FDTHDazExpression&& Expression, TArray<TArray<FVector3f>>&& Displacement)> Visit, FString& OutError) const;
+
+private:
+	FString File;
+	int32 Version = 0;
+	/** Face displacements are integers in this unit (cm). */
+	double GeoUnit = 1e-4;
+	struct FChunk { FString Samples; FString Geometry; };
+	TArray<FChunk> Chunks;
 };

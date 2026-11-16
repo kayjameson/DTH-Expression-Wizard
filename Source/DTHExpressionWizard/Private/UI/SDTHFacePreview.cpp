@@ -6,7 +6,8 @@
 #include "Engine/SkeletalMesh.h"
 #include "ImageUtils.h"
 #include "RenderingThread.h"
-#include "Mixer/DTHCurveDriverInstance.h"
+#include "DTHCurveDriverInstance.h"
+#include "DTHFaceBones.h"
 
 namespace
 {
@@ -94,7 +95,11 @@ void SDTHFacePreview::SetValues(const TMap<FName, float>& Values)
 {
 	if (UDTHCurveDriverInstance* Driver = Component ? Cast<UDTHCurveDriverInstance>(Component->GetAnimInstance()) : nullptr)
 	{
-		Driver->SetCurves(Values);
+		TMap<FName, float> Curves;
+		TMap<FName, FQuat> Turns;
+		DTHFaceBones::Split(Values, Curves, Turns);
+		Driver->SetCurves(Curves);
+		Driver->SetBones(Component->GetSkeletalMeshAsset() ? DTHFaceBones::Local(Component->GetSkeletalMeshAsset()->GetRefSkeleton(), Turns) : TMap<FName, FTransform>());
 	}
 }
 

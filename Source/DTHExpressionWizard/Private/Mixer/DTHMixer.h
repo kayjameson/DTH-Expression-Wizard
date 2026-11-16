@@ -16,14 +16,18 @@ struct FDTHMixEntry
 };
 
 /**
- * The Mixer's work, without any UI: mixing face-board values, and writing them into curve-only animation sequences.
- * A face sequence holds only CTRL_expressions_* curves and the skeleton's root at its reference pose, and is additive
+ * The Mixer's work, without any UI: mixing face values, and writing them into face sequences. A face sequence holds the
+ * face curves (CTRL_expressions_*, DTH's fac* morph curves), the face bones turned past DTH's face rig when an
+ * expression needs them (jaw, tongue: DTHFaceBones) and the skeleton's root at its reference pose, and is additive
  * (local space, against the reference pose), so it moves no bones and layers over a body animation; DTH's
  * post-process blueprint reads its curves exactly as it reads the face board.
  */
 struct FDTHMixer
 {
-	/** Every curve of the library (AllCurves) with its mixed value: sum of strength * value, clamped to [0, 1]. */
+	/** A face-board curve (CTRL_expressions_*), as opposed to one of DTH's morph curves (fac*). */
+	static bool IsBoardCurve(FName Curve) { return Curve.ToString().StartsWith(TEXT("CTRL_")); }
+
+	/** Every curve of the library (AllCurves) with its mixed value: sum of strength * value, board curves clamped to [0, 1]. */
 	static void Mix(const UDTHExpressionLibrary& Library, TConstArrayView<FDTHMixEntry> Entries, TMap<FName, float>& OutValues);
 
 	/** A new face sequence asset in Folder (saved). Null with OutError if it cannot be made. */

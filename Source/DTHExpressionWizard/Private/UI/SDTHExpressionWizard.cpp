@@ -286,10 +286,8 @@ FText SDTHExpressionWizard::GetLibrarySummary() const
 		Settings->SamplesFile.FilePath.IsEmpty() ? TEXT("(not set: see Settings)") : *Settings->SamplesFile.FilePath, *Settings->LibraryAsset);
 	if (Lib)
 	{
-		int32 Partial = 0;
-		for (const FDTHExpression& E : Lib->Expressions) Partial += E.Missing.IsEmpty() ? 0 : 1;
 		Text += FString::Printf(TEXT("Built from samples taken %s: %d expressions (%d without some shapes DTH's face cannot make), %d skipped. Gaze %s."),
-			*Lib->SampledAt, Lib->Expressions.Num(), Partial, Lib->Skipped.Num(), Lib->bGazeStripped ? TEXT("stripped") : TEXT("kept"));
+			*Lib->SampledAt, Lib->Expressions.Num(), NumPartial, Lib->Skipped.Num(), Lib->bGazeStripped ? TEXT("stripped") : TEXT("kept"));
 	}
 	else
 	{
@@ -306,6 +304,8 @@ FReply SDTHExpressionWizard::OnBuild()
 	{
 		FScopedSlowTask Task(1.f, LOCTEXT("Building", "Building the expression library..."));
 		Task.MakeDialog();
+		// the build's own progress shows inside this frame
+		Task.EnterProgressFrame(1.f);
 		FDTHLibraryBuild::Build(Settings->SamplesFile.FilePath, Settings->LibraryAsset, Cast<USkeletalMesh>(Settings->PreviewMesh.TryLoad()),
 			Settings->bStripGaze, Report);
 	}
@@ -329,6 +329,11 @@ void SDTHExpressionWizard::LoadLibrary()
 {
 	const FString& Path = GetDefault<UDTHExpressionSettings>()->LibraryAsset;
 	Library = Path.IsEmpty() ? nullptr : LoadObject<UDTHExpressionLibrary>(nullptr, *Path, nullptr, LOAD_NoWarn | LOAD_Quiet);
+	NumPartial = 0;
+	if (const UDTHExpressionLibrary* Lib = Library.Get())
+	{
+		for (const FDTHExpression& E : Lib->Expressions) NumPartial += E.Missing.IsEmpty() ? 0 : 1;
+	}
 	MixRows.Reset();
 	Icons.Reset();
 	RefreshExpressionList();
@@ -544,9 +549,16 @@ void SDTHExpressionWizard::RefreshExpressionList()
 
 const FSlateBrush* SDTHExpressionWizard::GetIcon(int32 Expression)
 {
-	if (const TSharedPtr<FSlateDynamicImageBrush>* Found = Icons.Find(Expression))
+	if (FIcon* Found = Icons.Find(Expression))
 	{
-		return Found->IsValid() ? Found->Get() : FAppStyle::GetBrush("ClassIcon.AnimSequence");
+		Found->Frame = GFrameCounter;
+		return Found->Brush.IsValid() ? Found->Brush.Get() : FAppStyle::GetBrush("ClassIcon.AnimSequence");
+	}
+	// A library can hold hundreds of thousands of presets: keep only the icons drawn in the last few frames.
+	constexpr int32 MaxIcons = 512;
+	if (Icons.Num() >= MaxIcons)
+	{
+		for (auto It = Icons.CreateIterator(); It; ++It) if (It->Value.Frame + 10 < GFrameCounter) It.RemoveCurrent();
 	}
 	TSharedPtr<FSlateDynamicImageBrush> Brush;
 	const UDTHExpressionLibrary* Lib = Library.Get();
@@ -554,7 +566,7 @@ const FSlateBrush* SDTHExpressionWizard::GetIcon(int32 Expression)
 	{
 		Brush = MakeShared<FSlateDynamicImageBrush>(FName(*Lib->Expressions[Expression].IconFile), FVector2D(40.0, 40.0));
 	}
-	Icons.Add(Expression, Brush);
+	Icons.Add(Expression, {Brush, GFrameCounter});
 	return Brush.IsValid() ? Brush.Get() : FAppStyle::GetBrush("ClassIcon.AnimSequence");
 }
 
@@ -577,7 +589,7 @@ TSharedRef<ITableRow> SDTHExpressionWizard::MakeExpressionRow(TSharedPtr<int32> 
 			[
 				SNew(SBox).WidthOverride(40.f).HeightOverride(40.f)
 				[
-					SNew(SImage).Image(GetIcon(Index))
+					SNew(SImage).Image_Lambda([this, Index]() { return GetIcon(Index); })
 				]
 			]
 			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)

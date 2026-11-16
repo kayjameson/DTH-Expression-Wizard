@@ -15,18 +15,20 @@
 #include "Library/DTHExpressionLibrary.h"
 #include "Library/DTHExpressionSamples.h"
 #include "Library/DTHLibraryBuild.h"
-#include "Library/DTHFaceRig.h"
-#include "Library/DTHFaceRigProbe.h"
+#include "DTHFaceRig.h"
+#include "DTHFaceRigProbe.h"
 #include "DTHRigKeying.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Settings/DTHExpressionSettings.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Solve/DTHExpressionSolver.h"
-#include "Solve/DTHFaceEvaluator.h"
-#include "Solve/DTHFaceTarget.h"
-#include "Solve/DTHShapeFit.h"
+#include "DTHFaceEvaluator.h"
+#include "DTHFaceTarget.h"
+#include "DTHShapeFit.h"
+#include "DTHFaceFitter.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -73,6 +75,52 @@ namespace
 		double E = 0.0, W = 0.0;
 		for (int32 I = 0; I < Want.Num(); ++I) { E += FVector3f::DistSquared(Got[I], Want[I]); W += Want[I].SizeSquared(); }
 		return W > 0.0 ? 1.0 - FMath::Sqrt(E / W) : 1.0;
+	}
+
+	/** The face region a point belongs to, from the Genesis 9 face bone that moves it most. */
+	const TCHAR* Region(const FName Bone)
+	{
+		const FString B = Bone.ToString();
+		if (B.StartsWith(TEXT("brow"))) return TEXT("brows");
+		if (B.StartsWith(TEXT("eyelid_upper"))) return TEXT("upper lids");
+		if (B.StartsWith(TEXT("eyelid_lower")) || B.StartsWith(TEXT("squint"))) return TEXT("lower lids");
+		if (B.StartsWith(TEXT("nose")) || B.StartsWith(TEXT("nostril"))) return TEXT("nose");
+		if (B.StartsWith(TEXT("cheek"))) return TEXT("cheeks");
+		if (B.StartsWith(TEXT("lip_corner"))) return TEXT("lip corners");
+		if (B.StartsWith(TEXT("lip"))) return TEXT("lips");
+		if (B == TEXT("lower_jaw") || B == TEXT("chin") || B.StartsWith(TEXT("jaw"))) return TEXT("jaw and chin");
+		if (B.Contains(TEXT("teeth"))) return TEXT("teeth and gums");
+		if (B.StartsWith(TEXT("tongue"))) return TEXT("tongue");
+		return TEXT("rest of the head");
+	}
+
+	/**
+	 * The recreation region by region, in mm: for each region with a point Daz moves more than 0.5 mm, how far Daz moves it
+	 * at most, and Unreal's largest and 95th-percentile error against Daz. Worst is the largest error of any region.
+	 */
+	FString RegionReport(const FDTHFaceEvaluator& Evaluator, TConstArrayView<FVector3f> Got, TConstArrayView<FVector3f> Want, double& OutWorstMm, FString& OutWorstRegion)
+	{
+		struct FStats { TArray<float> Errors; float Moves = 0.0f; };
+		TMap<FString, FStats> ByRegion;
+		for (int32 P = 0; P < Want.Num(); ++P)
+		{
+			FStats& S = ByRegion.FindOrAdd(Region(Evaluator.DominantBone(P)));
+			S.Errors.Add(10.0f * FVector3f::Dist(Got[P], Want[P]));
+			S.Moves = FMath::Max(S.Moves, 10.0f * Want[P].Size());
+		}
+		ByRegion.KeySort(TLess<FString>());
+		FString Out;
+		OutWorstMm = 0.0;
+		for (TPair<FString, FStats>& R : ByRegion)
+		{
+			if (R.Value.Moves < 0.5f) continue;
+			R.Value.Errors.Sort();
+			const float Largest = R.Value.Errors.Last();
+			const float P95 = R.Value.Errors[FMath::Min(R.Value.Errors.Num() - 1, R.Value.Errors.Num() * 95 / 100)];
+			Out += FString::Printf(TEXT(" %s %.1f/%.1f mm (Daz moves %.1f);"), *R.Key, Largest, P95, R.Value.Moves);
+			if (Largest > OutWorstMm) { OutWorstMm = Largest; OutWorstRegion = R.Key; }
+		}
+		return Out;
 	}
 }
 
@@ -153,8 +201,12 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 	TArray<FDTHShapeFit::FBoardCurve> Board;
 	for (const DTHRigKeying::FBoardSlot& S : DTHRigKeying::BoardMap(DTHRigKeying::DefaultRig(Character))) Board.Add({S.Curve, S.Control, S.Axis, S.Sign});
 	const double T0 = FPlatformTime::Seconds();
-	if (!Evaluator.Init(Character, Error) || !Face.Build(Samples, Evaluator, Report, Error, CharacterRest.IsEmpty() ? nullptr : &CharacterRest)
-		|| !Shape.Init(Evaluator, Board, Rig, Report, Error))
+	bool bMorphs = true, bBones = true;
+	Config->TryGetBoolField(TEXT("morphs"), bMorphs);
+	Config->TryGetBoolField(TEXT("bones"), bBones);
+	if (!Evaluator.Init(Character, Error) || !Face.Build(Samples.Face, Evaluator, Report, Error, CharacterRest.IsEmpty() ? nullptr : &CharacterRest)
+		|| !Shape.Init(Evaluator, Board, Rig, Report, Error, bMorphs ? TArray<FName>(Evaluator.FaceMorphCurves()) : TArray<FName>(),
+			bBones ? FDTHFaceFitter::TurnableBones(*Character) : TArray<FName>()))
 	{
 		AddError(Error);
 		return false;
@@ -165,8 +217,26 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 	Config->TryGetNumberField(TEXT("threshold"), Threshold);
 	const TSharedPtr<FJsonObject>* Own = nullptr;
 	Config->TryGetObjectField(TEXT("characterExpressions"), Own);
+	// The listed expressions only, with their face shapes, read from the samples one file at a time.
+	TSet<FString> Wanted;
+	for (const TSharedPtr<FJsonValue>& L : Config->GetArrayField(TEXT("labels"))) Wanted.Add(L->AsString());
 	TMap<FString, int32> ByLabel;
-	for (int32 I = 0; I < Samples.Expressions.Num(); ++I) ByLabel.Add(Samples.Expressions[I].Label, I);
+	TArray<FDTHDazExpression> Expressions;
+	TArray<TArray<TArray<FVector3f>>> Shapes;
+	if (!Samples.ReadExpressions([&](FDTHDazExpression&& E, TArray<TArray<FVector3f>>&& D)
+		{
+			if (Wanted.Contains(E.Label) && !ByLabel.Contains(E.Label))
+			{
+				ByLabel.Add(E.Label, Expressions.Num());
+				Expressions.Add(MoveTemp(E));
+				Shapes.Add(MoveTemp(D));
+			}
+			return true;
+		}, Error))
+	{
+		AddError(Error);
+		return false;
+	}
 
 	int32 Passed = 0, Total = 0;
 	double Slowest = 0.0;
@@ -176,9 +246,19 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 		const FString Label = L->AsString();
 		const int32* I = ByLabel.Find(Label);
 		TArray<FVector3f> Target;
-		if (!I || !Face.Target(Samples, *I, Target)) { Report.Add(TEXT("MISSING ") + Label); AddError(TEXT("not in the samples: ") + Label); continue; }
+		if (!I || !Face.Target(Shapes[*I], Target)) { Report.Add(TEXT("MISSING ") + Label); AddError(TEXT("not in the samples: ") + Label); continue; }
 		FDTHShapeFit::FOptions Options;
+		Config->TryGetNumberField(TEXT("morphCost"), Options.MorphCost);
+		Config->TryGetNumberField(TEXT("morphMin"), Options.MorphMin);
+		Config->TryGetNumberField(TEXT("morphMax"), Options.MorphMax);
+		Config->TryGetNumberField(TEXT("timeBudget"), Options.TimeBudget);
+		// expressions leave the gaze out (the library's default)
+		for (const FName& C : Shape.Curves()) if (C.ToString().StartsWith(TEXT("bone|eye_"))) Options.Fixed.Add(C);
 		const FDTHShapeFit::FResult R = Shape.Fit(Target, Options);
+		int32 MorphsUsed = 0;
+		double MorphLargest = 0.0;
+		for (int32 K = 0; K < R.Values.Num(); ++K)
+			if (Shape.IsMorph(K) && R.Values[K] != 0.0f) { ++MorphsUsed; MorphLargest = FMath::Max(MorphLargest, (double)FMath::Abs(R.Values[K])); }
 		Slowest = FMath::Max(Slowest, R.Seconds);
 		// the pass mark is on the character's own Daz face when it is given, else on the sampled face
 		double Score = R.Match;
@@ -194,7 +274,7 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 				for (int32 F = 0; F < D.Num(); ++F)
 					for (int32 V = 0; V < D[F].Num() && V < Rest[F].Num(); ++V) D[F][V] -= Rest[F][V];
 				TArray<FVector3f> OwnTarget, Got;
-				if (Face.TargetFromMeshes(Samples, D, OwnTarget))
+				if (Face.TargetFromMeshes(Samples.Face, D, OwnTarget))
 				{
 					Shape.Displacement(R.Values, Got);
 					const double OwnMatch = Match(Got, OwnTarget);
@@ -215,6 +295,10 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 				const double E2 = FVector3f::DistSquared(Got[P], Target[P]);
 				B.Key += E2; B.Value += Target[P].SizeSquared(); Total2 += E2;
 			}
+			double WorstMm = 0.0;
+			FString WorstRegion;
+			const FString Regions = RegionReport(Evaluator, Got, Target, WorstMm, WorstRegion);
+			Extra += FString::Printf(TEXT(" | worst region %s %.1f mm | by region (largest/95%% error):%s"), *WorstRegion, WorstMm, *Regions);
 			ByBone.ValueSort([](const TPair<double, double>& A, const TPair<double, double>& B) { return A.Key > B.Key; });
 			int32 Shown = 0;
 			Extra += TEXT(" | error by bone:");
@@ -227,7 +311,9 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 		}
 		++Total;
 		const bool bPass = Score >= Threshold;
-		if (!bPass)
+		bool bLimits = true;
+		Config->TryGetBoolField(TEXT("limits"), bLimits);
+		if (!bPass && bLimits)
 		{
 			// what limits it: the board's one-side rule, its 0..1 range, or DTH's poses themselves
 			FDTHShapeFit::FOptions Relaxed;
@@ -240,7 +326,7 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 			Relaxed.MaxValue = 1.0;
 			const double Longer = Shape.Fit(Target, Relaxed).Match;
 			// other starting points: the slider-space fit of the old library, and nothing at all
-			const FDTHExpressionFit Leaf = LeafSolver.Fit(Samples.Expressions[*I].State);
+			const FDTHExpressionFit Leaf = LeafSolver.Fit(Expressions[*I].State);
 			Relaxed.Start.Init(0.0, Shape.Curves().Num());
 			for (int32 K = 0; K < Shape.Curves().Num(); ++K)
 			{
@@ -254,8 +340,8 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 				100.0 * Longer, 100.0 * NoSide, 100.0 * NoLimits, 100.0 * FromLeaf, 100.0 * FromZero);
 		}
 		Passed += bPass ? 1 : 0;
-		Report.Add(FString::Printf(TEXT("%s %5.1f%%  %s (sampled face %.1f%%, model %.1f%%, %d evaluations, %d steps, %.2f s of which model %.2f s%s)"),
-			bPass ? TEXT("PASS") : TEXT("FAIL"), 100.0 * Score, *Label, 100.0 * R.Match, 100.0 * R.ModelMatch, R.Evaluations, R.Iterations, R.Seconds, R.ModelSeconds, *Extra));
+		Report.Add(FString::Printf(TEXT("%s %5.1f%%  %s (sampled face %.1f%%, model %.1f%%, %d morph curves up to %.2f, %d evaluations, %d steps, %.2f s of which model %.2f s%s)"),
+			bPass ? TEXT("PASS") : TEXT("FAIL"), 100.0 * Score, *Label, 100.0 * R.Match, 100.0 * R.ModelMatch, MorphsUsed, MorphLargest, R.Evaluations, R.Iterations, R.Seconds, R.ModelSeconds, *Extra));
 	}
 	Report.Add(FString::Printf(TEXT("%d of %d at or above %.0f%%. Slowest fit %.2f s."), Passed, Total, 100.0 * Threshold, Slowest));
 	FString ReportFile;
@@ -263,7 +349,68 @@ bool FDTHShapeFitTest::RunTest(const FString& Parameters)
 	FFileHelper::SaveStringArrayToFile(Report, *ReportFile);
 	for (const FString& Line : Report) AddInfo(Line);
 	TestTrue(TEXT("every expression at or above the pass mark"), Passed == Total && Total > 0);
-	TestTrue(TEXT("every fit within 2 s"), Slowest <= 2.0);
+	TestTrue(TEXT("every fit within its time budget (3 s, one step over at most)"), Slowest <= 3.5);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDTHTransferTest, "DTH.ExpressionWizard.Transfer",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * The same library values on several characters: how far each region of the face moves on each, in mm, played through the
+ * character's own post-process blueprint. Inputs: transferCharacters (skeletal meshes), transferFilter (a label substring)
+ * and transferLimit; the library is the wizard's (Settings: Library Asset).
+ */
+bool FDTHTransferTest::RunTest(const FString& Parameters)
+{
+	const TSharedPtr<FJsonObject> Config = LoadConfig(*this);
+	if (!Config) return false;
+	const UDTHExpressionLibrary* Library = LoadObject<UDTHExpressionLibrary>(nullptr, *GetDefault<UDTHExpressionSettings>()->LibraryAsset);
+	if (!Library) { AddError(TEXT("no library at Settings: Library Asset")); return false; }
+	FString Filter;
+	Config->TryGetStringField(TEXT("transferFilter"), Filter);
+	int32 Limit = 10;
+	Config->TryGetNumberField(TEXT("transferLimit"), Limit);
+	TArray<int32> Picked;
+	for (int32 I = 0; I < Library->Expressions.Num() && Picked.Num() < Limit; ++I)
+	{
+		if (Filter.IsEmpty() || Library->Expressions[I].Label.Contains(Filter)) Picked.Add(I);
+	}
+	TArray<FString> Report;
+	Report.Add(FString::Printf(TEXT("Library %s: %d expressions matching \"%s\"."), *Library->GetPathName(), Picked.Num(), *Filter));
+	for (const TSharedPtr<FJsonValue>& C : Config->GetArrayField(TEXT("transferCharacters")))
+	{
+		USkeletalMesh* Character = LoadObject<USkeletalMesh>(nullptr, *C->AsString());
+		FDTHFaceEvaluator Evaluator;
+		FString Error;
+		if (!Character || !Evaluator.Init(Character, Error)) { AddError(C->AsString() + TEXT(": ") + Error); continue; }
+		TArray<int32> All;
+		All.SetNumUninitialized(Evaluator.NumVertices());
+		for (int32 V = 0; V < All.Num(); ++V) All[V] = V;
+		Evaluator.SetVertices(All);
+		TArray<FVector3f> Rest, Posed;
+		Evaluator.Evaluate({}, Rest);
+		Report.Add(FString::Printf(TEXT("== %s"), *Character->GetPathName()));
+		for (const int32 I : Picked)
+		{
+			const FDTHExpression& E = Library->Expressions[I];
+			TMap<FName, float> Curves;
+			for (int32 K = 0; K < E.Curves.Num(); ++K) Curves.Add(E.Curves[K], E.Values[K]);
+			Evaluator.Evaluate(Curves, Posed);
+			TMap<FString, float> Moves;
+			for (int32 P = 0; P < Posed.Num(); ++P)
+			{
+				float& M = Moves.FindOrAdd(Region(Evaluator.DominantBone(P)));
+				M = FMath::Max(M, 10.0f * FVector3f::Dist(Posed[P], Rest[P]));
+			}
+			Moves.KeySort(TLess<FString>());
+			FString Line = FString::Printf(TEXT("%s (%d curves, match %.0f%%):"), *E.Label, E.Curves.Num(), 100.0f * E.Match);
+			for (const TPair<FString, float>& M : Moves) if (M.Value >= 0.1f) Line += FString::Printf(TEXT(" %s %.1f;"), *M.Key, M.Value);
+			Report.Add(Line);
+		}
+	}
+	FFileHelper::SaveStringArrayToFile(Report, *(FPaths::ProjectSavedDir() / TEXT("DTHExpressionWizard/TransferReport.txt")));
+	for (const FString& Line : Report) AddInfo(Line);
 	return true;
 }
 
@@ -280,11 +427,12 @@ bool FDTHBuildLibraryTest::RunTest(const FString& Parameters)
 	USkeletalMesh* Character = LoadObject<USkeletalMesh>(nullptr, *Config->GetStringField(TEXT("character")));
 	TArray<FDTHBuildMessage> Messages;
 	const double T0 = FPlatformTime::Seconds();
+	// as the wizard builds it: the gaze left out
 	const UDTHExpressionLibrary* Library = FDTHLibraryBuild::Build(Config->GetStringField(TEXT("samples")), Asset, Character, false, Messages);
 	TArray<FString> Lines;
 	for (const FDTHBuildMessage& M : Messages) Lines.Add(M.Text);
 	Lines.Add(FString::Printf(TEXT("Built in %.0f s."), FPlatformTime::Seconds() - T0));
-	// every expression is held by the face board as it is (no layer corrections), as a face-board key needs
+	// how many expressions go past the face board (DTH's morph curves, face bones): a control rig key carries them on its layer
 	int32 NeedLayer = 0, Pass = 0;
 	if (Library)
 	{
@@ -299,13 +447,12 @@ bool FDTHBuildLibraryTest::RunTest(const FString& Parameters)
 			if (!DTHRigKeying::FaceBoard(RigClass, Curves, Controls, Layer, Corrected, Error) || Corrected > 0)
 			{
 				++NeedLayer;
-				if (NeedLayer <= 10) Lines.Add(FString::Printf(TEXT("NOT ON THE BOARD: %s (%d curves need a layer correction) %s"), *E.Label, Corrected, *Error));
+				if (!Error.IsEmpty()) Lines.Add(FString::Printf(TEXT("ERROR: %s: %s"), *E.Label, *Error));
 			}
 			Pass += E.Match >= 0.94f ? 1 : 0;
 		}
-		Lines.Add(FString::Printf(TEXT("%d of %d expressions at or above 94%%; %d need a layer correction (0 expected)."), Pass, Library->Expressions.Num(), NeedLayer));
+		Lines.Add(FString::Printf(TEXT("%d of %d expressions at or above 94%%; %d go past the face board (morph curves or face bones, keyed on a control rig's layer)."), Pass, Library->Expressions.Num(), NeedLayer));
 	}
-	TestEqual(TEXT("every expression held by the face board"), NeedLayer, 0);
 	FFileHelper::SaveStringArrayToFile(Lines, *(FPaths::ProjectSavedDir() / TEXT("DTHExpressionWizard/BuildLibraryReport.txt")));
 	return TestNotNull(TEXT("library built"), Library);
 }
@@ -376,7 +523,7 @@ bool FDTHPoseFloorTest::RunTest(const FString& Parameters)
 	FDTHFaceEvaluator Evaluator;
 	FDTHFaceTarget Face;
 	TArray<FString> Report;
-	if (!Evaluator.Init(Character, Error) || !Face.Build(Samples, Evaluator, Report, Error)) { AddError(Error); return false; }
+	if (!Evaluator.Init(Character, Error) || !Face.Build(Samples.Face, Evaluator, Report, Error)) { AddError(Error); return false; }
 	TMap<FString, TArray<FVector3f>> Rest;
 	if (!LoadDump(Folder / TEXT("rom0_geo.txt"), Rest)) { AddError(TEXT("no rom0_geo.txt in ") + Folder); return false; }
 	const TArray<TArray<FVector3f>> RestByFigure = ByFigure(Samples, Rest);
@@ -400,7 +547,7 @@ bool FDTHPoseFloorTest::RunTest(const FString& Parameters)
 		TArray<TArray<FVector3f>> D = ByFigure(Samples, Dump);
 		for (int32 F = 0; F < D.Num(); ++F)
 			for (int32 V = 0; V < D[F].Num() && V < RestByFigure[F].Num(); ++V) D[F][V] -= RestByFigure[F][V];
-		if (!Face.TargetFromMeshes(Samples, D, Want)) continue;
+		if (!Face.TargetFromMeshes(Samples.Face, D, Want)) continue;
 		Evaluator.Evaluate({{Rig.Curves[C.Key], 1.0f}}, Got);
 		for (int32 P = 0; P < Got.Num(); ++P) Got[P] -= Base[P];
 		double Largest = 0.0;

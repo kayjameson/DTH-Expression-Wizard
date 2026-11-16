@@ -33,6 +33,8 @@ public class DTHExpressionWizard : ModuleRules
 			"ApplicationCore",
 			"RenderCore",
 			"DTHRigKeying",
+			"DTHFaceCore",
+			"DTHPoseCore",
 			"AnimationCore",
 			"ControlRig",
 			"RigVM",

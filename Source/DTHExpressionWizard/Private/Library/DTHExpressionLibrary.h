@@ -23,7 +23,10 @@ struct FDTHExpression
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Expression")
 	FString IconFile;
 
-	/** Face-board curves (CTRL_expressions_*) and their values at full strength. */
+	/**
+	 * What plays the expression at full strength: face-board curves (CTRL_expressions_*), DTH's morph curves (fac*) and
+	 * face bone channels ("bone|<bone>|<axis>", DTHFaceBones: the jaw and tongue turned past DTH's face rig).
+	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Expression")
 	TArray<FName> Curves;
 

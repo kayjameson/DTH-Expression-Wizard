@@ -6,34 +6,57 @@
 // the current scene has unsaved changes.
 //
 // For each preset it records the FACS state (morph values, head bone channels) and the face's shape: how far every vertex
-// of the head and of the Mouth figure moved from rest (face.json, geo_*.txt).
+// of the head, of the Mouth figure and of the Eyes figure moved from rest (face.json, expressions/geo_*.txt).
 //
 // Expression presets are found the way Daz content is laid out: every pose preset in any folder named "Expressions"
 // under People/ in every content directory. Folders for another figure generation (People/Genesis 8 ...) are listed
 // and skipped: DTH's Genesis 9 face cannot play them.
 //
+// Libraries can hold hundreds of thousands of presets, so nothing here holds the whole library at once:
+// - the scan reads only the start of each file (its type) and writes the preset list in chunks of CHUNK presets;
+// - the samples are written one chunk at a time (expressions/expressions_*.json and geo_*.txt), and
+//   DTH_ExpressionSamples.json only lists the chunks;
+// - the figure's morphs and bones are looked up once, not for every preset, and only what a preset changed is set back;
+// - a run that stops (cancelled, or Daz closed) is resumed where it left off the next time the script runs. A preset that
+//   was loading when Daz went down is tried once more; if Daz goes down on it again it is listed as not loaded.
+//
 // Run it from Daz Studio (File > Open, or double-click), or through a script server with `var args = {...}` defined
-// first. Without args it does every step with the defaults below.
+// first (or the arguments as the script's first argument). Without args it does every step with the defaults below.
 //   args.step     "all" (default) | "prepare" | "sample" | "rom" | "finish"
 //   args.out      output folder (default: Documents/DTH Expression Wizard)
+//   args.fresh    true: start over even if an unfinished run is there to resume ("all")
 //   args.folders  extra content-library folders to sample as well (all subfolders), e.g. ["My Stuff/Faces"]
-//   args.first, args.count  ("sample") which presets of the prepared list to sample
+//   args.files    sample only these preset files (absolute, or relative to a content directory) instead of the scan
+//   args.chunk    ("sample") which chunk of the prepared list to sample (default: the first one not sampled yet)
+//   args.skip     preset files not to load (each stopped Daz in an earlier run); listed as not loaded, with the reason
 (function(){
-	var A = (typeof args !== "undefined" && args) ? args : {};
+	var passed = getArguments();
+	var A = (typeof args !== "undefined" && args) ? args : (passed.length && typeof passed[0] == "object" ? passed[0] : {});
+	var INTERACTIVE = !passed.length && typeof args === "undefined";
 	var STEP = A.step || "all";
 	var OUT = A.out || (App.getDocumentsPath() + "/DTH Expression Wizard");
+	var WORK = OUT + "/work";
 	var EXTRA_FOLDERS = A.folders || [];
+	var FILES = A.files || null;
+	var SKIP = {};
+	for (var s = 0; A.skip && s < A.skip.length; s++) SKIP[A.skip[s]] = true;
 	var FIGURE_FILE = "People/Genesis 9/Genesis 9.duf";
 	// DazToHue's Genesis 9 ROM presets, loaded as the DTH guide does (body preset on the figure, mouth preset on its Mouth)
 	var ROM_DIR = "DazToHue/Poses/Genesis 9/DQS";
 	var ROM_BASE = "G9 DQS JCM FAC - Base.duf";
 	var ROM_MOUTH = "G9 DQS JCM FAC - Mouth.duf";
 	var CHANNELS = ["XRotate", "YRotate", "ZRotate", "XTranslate", "YTranslate", "ZTranslate"];
+	// Presets per list and samples file.
+	var CHUNK = 100;
+	// The lines of a preset file read to find its type: Daz writes asset_info.type within the first few.
+	var HEADER_LINES = 40;
+	var TITLE = "DTH Expression Wizard";
 	var result = {step: STEP, messages: []};
 
 	function note(s) { result.messages.push(s); print(s); }
 
 	function contentPath(rel) {
+		if (/^[A-Za-z]:[\/\\]|^\//.test(rel)) return new DzFileInfo(rel).exists() ? rel : "";
 		var mgr = App.getContentMgr();
 		for (var i = 0; i < mgr.getNumContentDirectories(); i++) {
 			var p = mgr.getContentDirectoryPath(i) + "/" + rel;
@@ -42,8 +65,23 @@
 		return "";
 	}
 
+	function exists(path) { return new DzFileInfo(path).exists(); }
 	function readText(path) { var f = new DzFile(path); if (!f.open(DzFile.ReadOnly)) return null; var t = f.read(); f.close(); return t; }
 	function writeText(path, text) { var f = new DzFile(path); if (!f.open(DzFile.WriteOnly | DzFile.Truncate)) return false; f.write(text); f.close(); return true; }
+	function readJson(path) { var t = readText(path); return t === null || t === "" ? null : JSON.parse(t); }
+	function writeJson(path, value) { return writeText(path, JSON.stringify(value)); }
+	function removeFile(path) { if (exists(path)) { var info = new DzFileInfo(path); new DzDir(info.path()).remove(info.fileName()); } }
+	function pad(n) { var t = "" + n; while (t.length < 6) t = "0" + t; return t; }
+	function listFile(c) { return WORK + "/list_" + pad(c) + ".json"; }
+	// Relative to OUT: DTH_ExpressionSamples.json lists the chunks this way.
+	function chunkName(c) { return "expressions/expressions_" + pad(c) + ".json"; }
+	function geoName(c) { return "expressions/geo_" + pad(c) + ".txt"; }
+
+	function readState() { var st = readJson(WORK + "/state.json"); return st && st.version == 3 ? st : null; }
+	function writeState(st) { return writeJson(WORK + "/state.json", st); }
+	// The samples file is written after the chunk's geometry, so it marks the chunk done.
+	function chunkDone(c) { return exists(OUT + "/" + chunkName(c)); }
+	function chunksDone(st) { var n = 0; for (var c = 0; c < st.chunks; c++) if (chunkDone(c)) n++; return n; }
 
 	// The base figure and the figures fitted to it that carry face morphs (Genesis 9 Mouth, Eyes, Tear).
 	function figures() {
@@ -73,25 +111,47 @@
 		if (c == "YTranslate") return b.getYPosControl(); return b.getZPosControl();
 	}
 
-	// Final (evaluated) value of every morph and head bone channel that is not zero.
-	function sample() {
-		var morphs = {}, bones = {}, figs = figures();
+	// Every figure's morph values and head bone channels, and the main figure's sculpted morphs, looked up once per
+	// scene: looking up thousands of morphs again for each preset took most of a preset's time.
+	var REFS = null;
+	function refs() {
+		if (REFS) return REFS;
+		var morphs = [], bones = [], sculpt = [], figs = figures();
 		for (var i = 0; i < figs.length; i++) {
 			var f = figs[i], fn = f.getName(), obj = f.getObject();
 			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
 				var mod = obj.getModifier(m);
 				if (!mod || !mod.inherits("DzMorph")) continue;
-				var v = mod.getValueControl().getValue();
-				if (Math.abs(v) > 1e-6) morphs[fn + "|" + mod.getName()] = v;
+				morphs.push([fn + "|" + mod.getName(), mod.getValueControl()]);
+				// Not a Genesis 9 FACS shape but with vertex deltas of its own (a pack's sculpted shape)
+				var name = mod.getName();
+				if (fn == "Genesis9" && name.indexOf("facs_") != 0 && name.indexOf("_HD") < 0 && name.indexOf("body_bs_") != 0) {
+					var deltas = mod.getDeltas();
+					if (deltas && deltas.getNumDeltas() > 0) sculpt.push([name, mod.getValueControl()]);
+				}
 			}
 			var hb = headBones(f);
 			for (var k = 0; k < hb.length; k++)
-				for (var c = 0; c < CHANNELS.length; c++) {
-					var bv = channel(hb[k], CHANNELS[c]).getValue();
-					if (Math.abs(bv) > 1e-6) bones[fn + "|" + hb[k].getName() + "|" + CHANNELS[c]] = bv;
-				}
+				for (var c = 0; c < CHANNELS.length; c++) bones.push([fn + "|" + hb[k].getName() + "|" + CHANNELS[c], channel(hb[k], CHANNELS[c])]);
 		}
+		REFS = {morphs: morphs, bones: bones, sculpt: sculpt};
+		return REFS;
+	}
+
+	// Final (evaluated) value of every morph and head bone channel that is not zero.
+	function sample() {
+		var r = refs(), morphs = {}, bones = {}, i, v;
+		for (i = 0; i < r.morphs.length; i++) { v = r.morphs[i][1].getValue(); if (Math.abs(v) > 1e-6) morphs[r.morphs[i][0]] = v; }
+		for (i = 0; i < r.bones.length; i++) { v = r.bones[i][1].getValue(); if (Math.abs(v) > 1e-6) bones[r.bones[i][0]] = v; }
 		return {morphs: morphs, bones: bones};
+	}
+
+	// Morphs the preset turned on that are not Genesis 9 FACS shapes but carry vertex deltas of their own (a pack's
+	// sculpted shape): DTH's face can only approximate those.
+	function sculptedMorphs() {
+		var r = refs(), out = [];
+		for (var i = 0; i < r.sculpt.length; i++) if (Math.abs(r.sculpt[i][1].getValue()) >= 1e-4) out.push(r.sculpt[i][0]);
+		return out;
 	}
 
 	// User values of every morph, head bone channel and figure pose control, to put the face back after a preset.
@@ -113,54 +173,142 @@
 		}
 		return snap;
 	}
-	function restore(snap) { for (var i = 0; i < snap.length; i++) snap[i][0].setValue(snap[i][1]); }
+	// Only the properties the preset changed are set back: each set makes Daz re-evaluate the figure.
+	function restore(snap) { for (var i = 0; i < snap.length; i++) if (snap[i][0].getRawValue() != snap[i][1]) snap[i][0].setValue(snap[i][1]); }
 
-	function listPresets() {
-		var list = [], skipped = [], seen = {}, mgr = App.getContentMgr();
-		for (var i = 0; i < mgr.getNumContentDirectories(); i++) {
-			var root = mgr.getContentDirectoryPath(i);
-			if (new DzFileInfo(root + "/People").exists()) findExpressionFolders(root, "People", list, skipped, seen);
-			for (var e = 0; e < EXTRA_FOLDERS.length; e++)
-				if (new DzFileInfo(root + "/" + EXTRA_FOLDERS[e]).exists()) walk(root + "/" + EXTRA_FOLDERS[e], EXTRA_FOLDERS[e], list, skipped, seen);
+	// A preset's type from the start of its file, never the whole file. Compressed presets (gzip, not text) say nothing
+	// here: sampleChunk tells them apart when it loads them.
+	function presetType(file) {
+		var f = new DzFile(file);
+		if (!f.open(DzFile.ReadOnly)) return "";
+		var type = "";
+		for (var i = 0; i < HEADER_LINES && !type; i++) {
+			var line = f.readLine();
+			if (!line) break;
+			if (i == 0 && line.charAt(0) != "{") break;
+			var m = /"type"\s*:\s*"([^"]+)"/.exec(line);
+			if (m) type = m[1];
 		}
-		return {presets: list, skipped: skipped};
+		f.close();
+		return type;
+	}
+
+	// The scan: presets go to the list files CHUNK at a time as they are found.
+	function Scan() { this.buffer = []; this.chunks = 0; this.count = 0; this.skipped = []; this.seen = {}; this.cancelled = false; }
+	Scan.prototype.flush = function() {
+		if (!this.buffer.length) return;
+		writeJson(listFile(this.chunks), this.buffer);
+		this.chunks++;
+		this.buffer = [];
+	};
+
+	function listPresets(scan) {
+		var mgr = App.getContentMgr();
+		if (FILES) {
+			for (var f = 0; f < FILES.length && !scan.cancelled; f++) {
+				var path = contentPath(FILES[f]);
+				if (!path) { scan.skipped.push({file: FILES[f], reason: "not found in any content directory"}); continue; }
+				var info = new DzFileInfo(path);
+				addPreset(info.path(), info.path(), info.fileName(), scan);
+			}
+		}
+		else {
+			for (var i = 0; i < mgr.getNumContentDirectories() && !scan.cancelled; i++) {
+				var root = mgr.getContentDirectoryPath(i);
+				if (exists(root + "/People")) findExpressionFolders(root, "People", scan);
+				for (var e = 0; e < EXTRA_FOLDERS.length; e++)
+					if (exists(root + "/" + EXTRA_FOLDERS[e])) walk(root + "/" + EXTRA_FOLDERS[e], EXTRA_FOLDERS[e], scan);
+			}
+		}
+		scan.flush();
 	}
 	// Every folder named "Expressions" below People/: sampled if it belongs to Genesis 9 (People/Genesis 9...), listed as
 	// skipped otherwise.
-	function findExpressionFolders(root, rel, list, skipped, seen) {
+	function findExpressionFolders(root, rel, scan) {
 		var dirs = new DzDir(root + "/" + rel).entryList(DzDir.Dirs | DzDir.NoDotAndDotDot, DzDir.Name);
-		for (var j = 0; j < dirs.length; j++) {
+		for (var j = 0; j < dirs.length && !scan.cancelled; j++) {
 			var sub = rel + "/" + dirs[j];
 			if (dirs[j].toLowerCase() == "expressions") {
 				var figure = sub.split("/")[1];
-				if (figure.indexOf("Genesis 9") == 0) walk(root + "/" + sub, sub, list, skipped, seen);
-				else skipped.push({file: sub, reason: "made for " + figure + ", not Genesis 9"});
+				if (figure.indexOf("Genesis 9") == 0) walk(root + "/" + sub, sub, scan);
+				else scan.skipped.push({file: sub, reason: "made for " + figure + ", not Genesis 9"});
 			}
-			else findExpressionFolders(root, sub, list, skipped, seen);
+			else findExpressionFolders(root, sub, scan);
 		}
 	}
-	function walk(dirPath, rel, list, skipped, seen) {
+	function walk(dirPath, rel, scan) {
 		var d = new DzDir(dirPath);
 		var files = d.entryList(["*.duf"], DzDir.Files, DzDir.Name);
-		for (var i = 0; i < files.length; i++) {
-			if (seen[rel + "/" + files[i]]) continue;
-			seen[rel + "/" + files[i]] = true;
-			// Plain-text files say what they are; compressed ones are tried when sampled (samplePresets checks them).
-			var text = readText(dirPath + "/" + files[i]) || "";
-			var type = text.charAt(0) == "{" ? /"type"\s*:\s*"([^"]+)"/.exec(text) : null;
-			if (type && type[1] != "preset_pose") { skipped.push({file: rel + "/" + files[i], reason: "not a pose preset (" + type[1] + ")"}); continue; }
-			var icon = "", stem = dirPath + "/" + files[i].replace(/\.duf$/, "");
-			var icons = [dirPath + "/" + files[i] + ".png", stem + ".png", stem + ".tip.png"];
-			for (var k = 0; k < icons.length && !icon; k++) if (new DzFileInfo(icons[k]).exists()) icon = icons[k];
-			list.push({pack: rel, label: files[i].replace(/\.duf$/, ""), file: dirPath + "/" + files[i], icon: icon});
-		}
+		for (var i = 0; i < files.length && !scan.cancelled; i++) addPreset(dirPath, rel, files[i], scan);
 		var dirs = d.entryList(DzDir.Dirs | DzDir.NoDotAndDotDot, DzDir.Name);
-		for (var j = 0; j < dirs.length; j++) walk(dirPath + "/" + dirs[j], rel + "/" + dirs[j], list, skipped, seen);
+		for (var j = 0; j < dirs.length && !scan.cancelled; j++) walk(dirPath + "/" + dirs[j], rel + "/" + dirs[j], scan);
+	}
+	function addPreset(dirPath, rel, file, scan) {
+		if (scan.seen[rel + "/" + file]) return;
+		scan.seen[rel + "/" + file] = true;
+		stepProgress(1);
+		if (progressIsCancelled()) { scan.cancelled = true; return; }
+		var type = presetType(dirPath + "/" + file);
+		if (type && type != "preset_pose") { scan.skipped.push({file: rel + "/" + file, reason: "not a pose preset (" + type + ")"}); return; }
+		var icon = "", stem = dirPath + "/" + file.replace(/\.duf$/, "");
+		var icons = [dirPath + "/" + file + ".png", stem + ".png", stem + ".tip.png"];
+		for (var k = 0; k < icons.length && !icon; k++) if (exists(icons[k])) icon = icons[k];
+		scan.buffer.push({pack: rel, label: file.replace(/\.duf$/, ""), file: dirPath + "/" + file, icon: icon});
+		scan.count++;
+		if (scan.buffer.length == CHUNK) scan.flush();
+	}
+
+	// Files an earlier run (of this version or the one before) left in OUT, cleared before a fresh run.
+	function clearRun() {
+		var dirs = [OUT, WORK, OUT + "/expressions"];
+		var patterns = [/^samples_\d+\.json$/, /^geo_\d+\.txt$/, /^presets\.json$/, /^rest\.json$/, /^progress\.txt$/, /^list_\d+\.json$/,
+			/^state\.json$/, /^expressions_\d+\.json$/];
+		for (var d = 0; d < dirs.length; d++) {
+			if (!exists(dirs[d])) continue;
+			var files = new DzDir(dirs[d]).entryList(["*.json", "*.txt"], DzDir.Files, DzDir.Name);
+			for (var f = 0; f < files.length; f++)
+				for (var p = 0; p < patterns.length; p++) if (patterns[p].test(files[f])) { removeFile(dirs[d] + "/" + files[f]); break; }
+		}
+	}
+
+	// Base Genesis 9 as Daz ships it: a product that switches its own morph on for every Genesis 9 (a character's HD
+	// details, for one) makes the figure something else, and its face no longer lines up with a base DTH export. Every
+	// morph that is on but is not one of Daz's own Genesis 9 morphs (facs_, head_, body_) is set to 0, and named.
+	function baseOnly() {
+		var off = [];
+		for (var s = 0; s < Scene.getNumSkeletons(); s++) {
+			var fig = Scene.getSkeleton(s), obj = fig.getObject();
+			if (fig.getName().indexOf("Genesis9") != 0) continue;
+			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
+				var mod = obj.getModifier(m);
+				if (!mod || !mod.inherits("DzMorph")) continue;
+				var name = mod.getName(), vc = mod.getValueControl();
+				if (name.indexOf("facs_") == 0 || name.indexOf("head_") == 0 || name.indexOf("body_") == 0) continue;
+				if (Math.abs(vc.getRawValue()) < 1e-6) continue;
+				vc.setValue(0);
+				off.push(fig.getName() + " " + name);
+			}
+		}
+		if (off.length) note("Set to 0 on the base figure (a product switches them on for every Genesis 9): " + off.join(", ") + ".");
+	}
+
+	// A fresh base Genesis 9 in an empty scene.
+	function loadFigure() {
+		if (Scene.needsSave()) { result.error = "The open scene has unsaved changes. Save or close it, then run this again."; return false; }
+		Scene.clear();
+		REFS = null;
+		var fig = contentPath(FIGURE_FILE);
+		if (!fig) { result.error = "Genesis 9 is not installed (" + FIGURE_FILE + ")."; return false; }
+		App.getContentMgr().openFile(fig, true);
+		if (!mainFigure()) { result.error = "Loading Genesis 9 did not give a Genesis9 figure."; return false; }
+		baseOnly();
+		Scene.setTime(0);
+		return true;
 	}
 
 	// The face whose shape the Unreal fit reproduces: the figure's head (every vertex above HEAD_DEPTH cm below the top of
-	// the head) and the whole Mouth figure (teeth, gums, tongue). The eyes are left out.
-	var FACE_FIGURES = ["Genesis9", "Genesis9Mouth"];
+	// the head), the whole Mouth figure (teeth, gums, tongue) and the whole Eyes figure (the eyeballs: an expression's gaze).
+	var FACE_FIGURES = ["Genesis9", "Genesis9Mouth", "Genesis9Eyes"];
 	var HEAD_DEPTH = 26.0;
 	// Displacements are written as integers in this unit (cm): 1 micrometre.
 	var GEO_UNIT = 1e-4;
@@ -205,8 +353,8 @@
 		return out;
 	}
 
-	// One line per face figure: "<preset index> <figure index> <count> (<vertex> <dx> <dy> <dz>)*" in GEO_UNIT integers,
-	// for the face vertices that moved from rest.
+	// One line per face figure: "<preset index in its chunk> <figure index> <count> (<vertex> <dx> <dy> <dz>)*" in GEO_UNIT
+	// integers, for the face vertices that moved from rest.
 	function faceGeometryLines(index) {
 		var lines = [];
 		for (var f = 0; f < FACE.length; f++) {
@@ -221,49 +369,54 @@
 		return lines;
 	}
 
-	// Morphs the preset turned on that are not Genesis 9 FACS shapes but carry vertex deltas of their own (a pack's
-	// sculpted shape): DTH's face can only approximate those.
-	function sculptedMorphs() {
-		var out = [], main = mainFigure(), obj = main.getObject();
-		for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
-			var mod = obj.getModifier(m);
-			if (!mod || !mod.inherits("DzMorph") || Math.abs(mod.getValueControl().getValue()) < 1e-4) continue;
-			var name = mod.getName();
-			if (name.indexOf("facs_") == 0 || name.indexOf("_HD") >= 0 || name.indexOf("body_bs_") == 0) continue;
-			var deltas = mod.getDeltas();
-			if (deltas && deltas.getNumDeltas() > 0) out.push(name);
-		}
-		return out;
-	}
-
 	function prepare() {
-		if (Scene.needsSave()) { result.error = "The open scene has unsaved changes. Save or close it, then run this again."; return false; }
-		Scene.clear();
-		var fig = contentPath(FIGURE_FILE);
-		if (!fig) { result.error = "Genesis 9 is not installed (" + FIGURE_FILE + ")."; return false; }
-		App.getContentMgr().openFile(fig, true);
-		if (!mainFigure()) { result.error = "Loading Genesis 9 did not give a Genesis9 figure."; return false; }
-		Scene.setTime(0);
-		var found = listPresets();
-		new DzDir(OUT).mkpath(OUT);
-		writeText(OUT + "/presets.json", JSON.stringify(found));
-		writeText(OUT + "/rest.json", JSON.stringify(sample()));
-		writeText(OUT + "/face.json", JSON.stringify({unit: GEO_UNIT, figures: faceRegion()}));
-		note("Genesis 9 loaded; " + found.presets.length + " expression presets found, " + found.skipped.length + " files or folders skipped.");
+		if (!loadFigure()) return false;
+		clearRun();
+		new DzDir(WORK).mkpath(WORK);
+		new DzDir(OUT + "/expressions").mkpath(OUT + "/expressions");
+		var scan = new Scan();
+		startProgress(TITLE + ": finding expression presets", 0, true, true);
+		try { listPresets(scan); } finally { finishProgress(); }
+		if (scan.cancelled) { result.error = "Cancelled while finding the expression presets."; return false; }
+		writeJson(OUT + "/skipped.json", scan.skipped);
+		writeJson(WORK + "/rest.json", sample());
+		writeJson(OUT + "/face.json", {unit: GEO_UNIT, figures: faceRegion()});
+		writeState({version: 3, startedAt: new Date().toISOString(), presets: scan.count, chunks: scan.chunks, skipped: scan.skipped.length,
+			suspects: {}, crashed: {}, rom: false, complete: false});
+		note("Genesis 9 loaded; " + scan.count + " expression presets found, " + scan.skipped.length + " files or folders skipped.");
 		return true;
 	}
 
-	function samplePresets(first, count) {
-		var found = JSON.parse(readText(OUT + "/presets.json"));
-		var main = mainFigure(), out = [];
-		var last = Math.min(found.presets.length, first + count);
+	// A preset that was loading when Daz went down (progress.txt is still there) is tried once more, then left out.
+	function noteCrash(st) {
+		var progress = readText(WORK + "/progress.txt");
+		if (!progress) return;
+		var file = progress.split("\t")[1] || "";
+		removeFile(WORK + "/progress.txt");
+		if (!file) return;
+		st.suspects[file] = (st.suspects[file] || 0) + 1;
+		if (st.suspects[file] >= 2) st.crashed[file] = true;
+		writeState(st);
+	}
+
+	// Samples one chunk of the list into expressions/expressions_<chunk>.json and geo_<chunk>.txt. False if cancelled
+	// (nothing is written then).
+	function sampleChunk(st, c, snap, counts) {
+		var list = readJson(listFile(c)) || [];
+		var main = mainFigure(), out = [], geoLines = [];
+		if (!FACE) FACE = readJson(OUT + "/face.json").figures;
 		Scene.setTime(0);
-		// The face is put back to this after every preset, so one snapshot serves them all.
-		var snap = snapshot();
-		FACE = JSON.parse(readText(OUT + "/face.json")).figures;
-		var geoLines = [];
-		for (var i = first; i < last; i++) {
-			var p = found.presets[i];
+		for (var i = 0; i < list.length; i++) {
+			var p = list[i];
+			stepProgress(1);
+			if (progressIsCancelled()) return false;
+			if (SKIP[p.file] || st.crashed[p.file]) {
+				out.push({pack: p.pack, label: p.label, file: p.file, icon: p.icon, loaded: false, reason: "it stopped Daz Studio when loaded", state: null});
+				counts.notLoaded++;
+				continue;
+			}
+			// Which preset is loading, so a preset that stops Daz can be found and left out.
+			writeText(WORK + "/progress.txt", (c * CHUNK + i) + "\t" + p.file);
 			var nodes = Scene.getNumNodes();
 			Scene.selectAllNodes(false); main.select(true); Scene.setPrimarySelection(main);
 			var ok = App.getContentMgr().openFile(p.file, true), why = ok ? "" : "Daz could not load it";
@@ -275,12 +428,30 @@
 			var s = ok ? sample() : null;
 			if (ok) { geoLines = geoLines.concat(faceGeometryLines(i)); s.sculpted = sculptedMorphs(); }
 			restore(snap);
+			if (!ok) counts.notLoaded++;
 			out.push({pack: p.pack, label: p.label, file: p.file, icon: p.icon, loaded: ok, reason: why, state: s});
 		}
-		writeText(OUT + "/samples_" + first + ".json", JSON.stringify(out));
-		writeText(OUT + "/geo_" + first + ".txt", geoLines.join("\n"));
-		note("Sampled presets " + first + " to " + (last - 1) + " of " + found.presets.length + ".");
-		return last;
+		writeText(OUT + "/" + geoName(c), geoLines.join("\n"));
+		writeJson(OUT + "/" + chunkName(c), out);
+		removeFile(WORK + "/progress.txt");
+		return true;
+	}
+
+	// Every chunk not sampled yet. False if cancelled.
+	function samplePresets(st) {
+		var todo = [];
+		for (var c = 0; c < st.chunks; c++) if (!chunkDone(c)) todo.push(c);
+		if (!todo.length) return true;
+		var snap = snapshot(), counts = {notLoaded: 0};
+		var total = st.presets - (st.chunks - todo.length) * CHUNK;
+		startProgress(TITLE + ": sampling " + total + " expression presets", Math.max(total, 1), true, true);
+		var done = true;
+		try {
+			for (var t = 0; t < todo.length && done; t++) done = sampleChunk(st, todo[t], snap, counts);
+		} finally { finishProgress(); }
+		if (counts.notLoaded) note(counts.notLoaded + " presets did not load (the samples say why).");
+		if (!done) { result.error = "Cancelled. Run the script again to carry on where it stopped."; return false; }
+		return true;
 	}
 
 	// Every key of a property: [frame, value].
@@ -293,23 +464,10 @@
 	}
 
 	// The ROM's animated properties: morphs of the figure and its Mouth, and their head bone channels.
-	function animatedProperties(figs) {
-		var out = [];
-		for (var i = 0; i < figs.length; i++) {
-			var fn = figs[i].getName(), obj = figs[i].getObject();
-			for (var m = 0; obj && m < obj.getNumModifiers(); m++) {
-				var mod = obj.getModifier(m);
-				if (!mod || !mod.inherits("DzMorph")) continue;
-				var kk = keys(mod.getValueControl());
-				if (kk.length) out.push({name: fn + "|" + mod.getName(), keys: kk});
-			}
-			var hb = headBones(figs[i]);
-			for (var b = 0; b < hb.length; b++)
-				for (var c = 0; c < CHANNELS.length; c++) {
-					var kb = keys(channel(hb[b], CHANNELS[c]));
-					if (kb.length) out.push({name: fn + "|" + hb[b].getName() + "|" + CHANNELS[c], keys: kb});
-				}
-		}
+	function animatedProperties() {
+		var r = refs(), out = [], i, kk;
+		for (i = 0; i < r.morphs.length; i++) { kk = keys(r.morphs[i][1]); if (kk.length) out.push({name: r.morphs[i][0], keys: kk}); }
+		for (i = 0; i < r.bones.length; i++) { kk = keys(r.bones[i][1]); if (kk.length) out.push({name: r.bones[i][0], keys: kk}); }
 		return out;
 	}
 
@@ -333,9 +491,9 @@
 		return base;
 	}
 
-	function sampleRom() {
-		var main = mainFigure(), mouth = null, figs = figures();
-		for (var i = 0; i < figs.length; i++) if (figs[i].getName() == "Genesis9Mouth") mouth = figs[i];
+	// DTH's face ROM, sampled last: it leaves its keys on the figure.
+	function sampleRom(st) {
+		var main = mainFigure(), mouth = figureByName("Genesis9Mouth");
 		var base = contentPath(ROM_DIR + "/" + ROM_BASE), mouthRom = contentPath(ROM_DIR + "/" + ROM_MOUTH);
 		if (!base || !mouthRom || !mouth) { result.error = "DazToHue's Genesis 9 ROM presets (" + ROM_DIR + ") or the Genesis 9 Mouth are missing."; return false; }
 		var range = new DzTimeRange(0, 2000 * Scene.getTimeStep());
@@ -347,7 +505,7 @@
 		Scene.selectAllNodes(false); mouth.select(true); Scene.setPrimarySelection(mouth);
 		App.getContentMgr().openFile(mouthRom, true);
 
-		var props = animatedProperties(figures()), last = 0;
+		var props = animatedProperties(), last = 0;
 		for (var p = 0; p < props.length; p++)
 			for (var k = 0; k < props[p].keys.length; k++) last = Math.max(last, props[p].keys[k][0]);
 		var frames = {};
@@ -361,49 +519,95 @@
 			frames["" + fr] = s;
 		}
 		Scene.setTime(0);
-		writeText(OUT + "/rom.json", JSON.stringify({basePreset: ROM_DIR + "/" + ROM_BASE, mouthPreset: ROM_DIR + "/" + ROM_MOUTH, frames: frames}));
+		writeJson(OUT + "/rom.json", {basePreset: ROM_DIR + "/" + ROM_BASE, mouthPreset: ROM_DIR + "/" + ROM_MOUTH, frames: frames});
+		st.rom = true;
+		writeState(st);
 		note("Sampled DTH's ROM: frames 0 to " + last + ".");
 		return true;
 	}
 
-	function finish() {
-		var found = JSON.parse(readText(OUT + "/presets.json"));
-		var exprs = [], geometryFiles = [];
-		for (var first = 0; first < found.presets.length; ) {
-			var t = readText(OUT + "/samples_" + first + ".json");
-			if (t === null) { result.error = "Presets from " + first + " were not sampled."; return false; }
-			if (!new DzFileInfo(OUT + "/geo_" + first + ".txt").exists()) { result.error = "Presets from " + first + " have no face geometry: sample them again with this script."; return false; }
-			geometryFiles.push("geo_" + first + ".txt");
-			var part = JSON.parse(t);
-			exprs = exprs.concat(part);
-			first += part.length;
-			if (!part.length) break;
+	// DTH_ExpressionSamples.json: the rest state and the list of samples files, never the samples themselves.
+	function finish(st) {
+		var chunks = [];
+		for (var c = 0; c < st.chunks; c++) {
+			if (!chunkDone(c)) { result.error = "Presets " + (c * CHUNK) + " to " + (Math.min(st.presets, (c + 1) * CHUNK) - 1) + " were not sampled."; return false; }
+			chunks.push({samples: chunkName(c), geometry: geoName(c)});
 		}
-		// Version 2 adds the face shape: the face region (face.json) and each preset's face displacement (geometryFiles,
-		// next to this file), which the Unreal fit reproduces.
-		var doc = {format: "DTH Expression Samples", version: 2, sampledAt: new Date().toISOString(),
-			dazVersion: App.longVersionString, figure: "Genesis 9", extraFolders: EXTRA_FOLDERS,
-			rest: JSON.parse(readText(OUT + "/rest.json")), rom: JSON.parse(readText(OUT + "/rom.json")),
-			face: JSON.parse(readText(OUT + "/face.json")), geometryFiles: geometryFiles,
-			expressions: exprs, skipped: found.skipped};
-		writeText(OUT + "/DTH_ExpressionSamples.json", JSON.stringify(doc));
+		// Version 3: the samples in chunks (each with its face geometry, indices within the chunk); rom, face and skipped in
+		// files of their own next to this one.
+		var doc = {format: "DTH Expression Samples", version: 3, sampledAt: new Date().toISOString(),
+			dazVersion: App.longVersionString, figure: "Genesis 9", extraFolders: EXTRA_FOLDERS, files: FILES, presets: st.presets,
+			rest: readJson(WORK + "/rest.json"), rom: "rom.json", face: "face.json", chunks: chunks, skipped: "skipped.json"};
+		writeJson(OUT + "/DTH_ExpressionSamples.json", doc);
+		st.complete = true;
+		writeState(st);
 		result.file = OUT + "/DTH_ExpressionSamples.json";
-		note("Wrote " + result.file + " (" + exprs.length + " expressions).");
+		note("Wrote " + result.file + " (" + st.presets + " expression presets in " + chunks.length + " files).");
 		return true;
 	}
 
-	if (STEP == "prepare") prepare();
-	else if (STEP == "sample") result.next = samplePresets(A.first || 0, A.count || 25);
-	else if (STEP == "rom") sampleRom();
-	else if (STEP == "finish") finish();
-	else if (STEP == "all") {
-		if (prepare()) {
-			var total = JSON.parse(readText(OUT + "/presets.json")).presets.length;
-			for (var first = 0; first < total; ) first = samplePresets(first, 25);
-			if (sampleRom()) finish();
-		}
-		if (result.error) MessageBox.critical(result.error, "DTH Expression Wizard", "OK");
-		else MessageBox.information(result.messages.join("\n"), "DTH Expression Wizard", "OK");
+	// An unfinished run to carry on, or null for a fresh one.
+	function resumable() {
+		var st = readState();
+		if (!st || st.complete || A.fresh) return null;
+		if (!INTERACTIVE) return st;
+		var q = MessageBox.question("An unfinished run from " + st.startedAt + " is in " + OUT + ": " + Math.min(st.presets, chunksDone(st) * CHUNK) +
+			" of " + st.presets + " expression presets sampled.\n\nCarry on where it stopped, or start over (finds the presets again)?",
+			TITLE, "&Carry On", "&Start Over", "&Cancel");
+		if (q == 2) { result.error = "cancelled"; return null; }
+		return q == 0 ? st : null;
 	}
+
+	function all() {
+		var st = resumable();
+		if (result.error) return false;
+		if (st) {
+			if (!loadFigure()) return false;
+			noteCrash(st);
+			note("Carrying on the run from " + st.startedAt + ".");
+		}
+		else {
+			if (!prepare()) return false;
+			st = readState();
+		}
+		if (!samplePresets(st)) return false;
+		if (!st.rom && !sampleRom(st)) return false;
+		return finish(st);
+	}
+
+	function step() {
+		if (STEP == "prepare") return prepare();
+		var st = readState();
+		if (!st) { result.error = "Nothing prepared in " + OUT + ": run the prepare step first."; return false; }
+		if (STEP == "sample") {
+			if (!mainFigure() && !loadFigure()) return false;
+			noteCrash(st);
+			var c = typeof A.chunk == "number" ? A.chunk : -1;
+			for (var i = 0; c < 0 && i < st.chunks; i++) if (!chunkDone(i)) c = i;
+			if (c < 0 || c >= st.chunks) { result.next = -1; return true; }
+			var counts = {notLoaded: 0};
+			startProgress(TITLE + ": sampling chunk " + c, CHUNK, true, true);
+			var done;
+			try { done = sampleChunk(st, c, snapshot(), counts); } finally { finishProgress(); }
+			if (!done) { result.error = "Cancelled."; return false; }
+			result.next = -1;
+			for (var j = 0; j < st.chunks; j++) if (!chunkDone(j)) { result.next = j; break; }
+			note("Sampled chunk " + c + " of " + st.chunks + ".");
+			return true;
+		}
+		if (STEP == "rom") return sampleRom(st);
+		if (STEP == "finish") return finish(st);
+		result.error = "Unknown step " + STEP + ".";
+		return false;
+	}
+
+	if (STEP == "all") {
+		all();
+		if (INTERACTIVE && result.error != "cancelled") {
+			if (result.error) MessageBox.critical(result.messages.concat([result.error]).join("\n"), TITLE, "OK");
+			else MessageBox.information(result.messages.join("\n"), TITLE, "OK");
+		}
+	}
+	else step();
 	return result;
 })();
